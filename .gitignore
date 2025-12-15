@@ -51,3 +51,11 @@ __pycache__/
 *.ipynb_checkpoints
 toy_data.csv
 
+logs/
+cache/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+__pycache__/
+*.pyc
