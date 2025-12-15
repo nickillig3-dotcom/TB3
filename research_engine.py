@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Strategy‑Miner Research Engine (Patch 0003)
+Strategy‑Miner Research Engine (Patch 0004)
 
-Patch 0003 upgrades:
-- Train/Holdout evaluation (true OOS slice) + position reset at holdout start.
-- Anti-degenerate filters: min exposure / min active bars, calmar floor (in bt_eval).
-- Eval versioning via eval_id (hash of EvalConfig + score version).
-- Rolling features produce NaNs early; we apply a valid mask so we don't trade on invalid bars.
+Patch 0004 upgrades:
+- Deep Validation Stage (DVS): time-block cross-validation (k folds) across (warmup..end)
+- Stress integrated into CV:
+    * base: delay=0, cost_mult=1
+    * delay stress: delay=cv_delay_bars, cost_mult=1
+    * cost stress: delay=0, cost_mult=stress_cost_mult
+- Score v3: CV-first, reduces "last-holdout lucky" domination.
+- No DB schema changes; CV summary stored in metrics_json["cv"].
 
-Still: research-only, no execution/broker integration.
+Research-only, no execution integration.
 """
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, asdict
 from typing import Any, Callable
@@ -79,14 +83,15 @@ class SearchSpace:
 
 @dataclass(frozen=True)
 class EvalConfig:
-    # --- Evaluation identity ---
-    score_version: str = "score_v2"
+    # --- Identity ---
+    score_version: str = "score_v3_cv"
+
     # --- Costs ---
     costs: BacktestCosts = BacktestCosts(cost_bps=1.0, slippage_bps=0.5)
     stress_cost_mult: float = 3.0
 
-    # --- Split ---
-    holdout_frac: float = 0.20  # last 20% is OOS
+    # --- Split (Stage-1) ---
+    holdout_frac: float = 0.20
     min_train_bars: int = 5000
     min_holdout_bars: int = 1500
 
@@ -95,7 +100,7 @@ class EvalConfig:
     calmar_cap: float = 25.0
     n_walkforward_splits: int = 4
 
-    # --- Degeneracy / robustness filters ---
+    # --- Degeneracy / robustness filters (Stage-1) ---
     min_exposure_train: float = 0.02
     min_exposure_holdout: float = 0.01
     min_active_bars_train: int = 300
@@ -109,19 +114,31 @@ class EvalConfig:
     max_drawdown_abs_train: float = 0.75
     max_drawdown_abs_holdout: float = 0.75
 
-    # --- Performance gates ---
+    # --- Performance gates (Stage-1) ---
     min_train_sharpe: float = 0.25
     min_holdout_sharpe: float = 0.05
     min_holdout_stress_sharpe: float = 0.00
-
     min_wf_positive_segments: int = 2
     max_wf_dominance: float = 0.85
 
+    # --- Deep Validation Stage (Stage-2 CV) ---
+    deep_validation: bool = True
+    cv_folds: int = 5
+    cv_delay_bars: int = 1
+
+    # fold geometry
+    cv_min_fold_bars: int = 800
+
+    # gates
+    cv_min_positive_folds_frac: float = 0.60
+    cv_min_positive_folds: int = 0  # if >0 overrides frac rule
+    cv_min_sharpe: float = -0.20
+    cv_min_median_sharpe_base: float = 0.20
+    cv_min_median_sharpe_delay1: float = 0.10
+    cv_min_median_sharpe_coststress: float = 0.05
+
 
 def eval_id_from_eval_cfg(eval_cfg: EvalConfig) -> str:
-    """
-    Stable eval identifier to version results in the DB.
-    """
     payload = asdict(eval_cfg)
     h = stable_hash(payload)
     return f"eval_{h[:12]}"
@@ -165,16 +182,10 @@ def generate_genomes(rng: np.random.Generator, n: int, space: SearchSpace) -> li
             parts.append({"name": name, "window": w, "weight": weight})
 
         thr = float(rng.uniform(space.threshold_min, space.threshold_max))
-
         gate_mode = str(rng.choice(list(space.vol_gate_modes)))
         gate = {"mode": gate_mode, "window": int(rng.choice(list(space.vol_gate_windows)))}
 
-        genome = {
-            "type": "linear_alpha_v1",
-            "features": parts,
-            "threshold": thr,
-            "vol_gate": gate,
-        }
+        genome = {"type": "linear_alpha_v1", "features": parts, "threshold": thr, "vol_gate": gate}
         out.append(genome)
     return out
 
@@ -201,55 +212,196 @@ def _split_index(n_close: int, holdout_frac: float) -> int:
     return split
 
 
-def _score_v2(
-    mt: dict[str, Any],
-    mh: dict[str, Any],
-    mh_stress: dict[str, Any],
+def _warmup_index_for_genome(genome: dict[str, Any]) -> int:
+    """
+    Approx warmup to avoid evaluating long initial NaN/invalid region.
+    """
+    try:
+        ws = [int(p.get("window", 1)) for p in genome.get("features", [])]
+        gate = genome.get("vol_gate", {}) or {}
+        ws.append(int(gate.get("window", 1)))
+        wmax = max(ws) if ws else 1
+        return int(max(2, min(5000, wmax + 3)))
+    except Exception:
+        return 50
+
+
+def _apply_delay(pos_seg: np.ndarray, delay_bars: int) -> np.ndarray:
+    d = int(max(0, delay_bars))
+    if d == 0:
+        return pos_seg
+    out = np.roll(pos_seg, d).copy()
+    out[:d] = 0
+    return out
+
+
+def _timeblock_cv(
+    pos: np.ndarray,
+    ret: np.ndarray,
+    bar_seconds: int,
+    *,
+    genome: dict[str, Any],
+    costs: BacktestCosts,
+    stress_cost_mult: float,
+    folds: int,
+    delay_bars: int,
+    min_fold_bars: int,
+    mdd_floor: float,
+    calmar_cap: float,
+) -> dict[str, Any]:
+    """
+    Returns CV summary + small fold vectors.
+    Uses close-index folds on range [warmup..N).
+    """
+    n_close = int(pos.shape[0])
+    if ret.shape[0] != n_close - 1:
+        return {"error": "cv_shape_mismatch"}
+
+    warmup = _warmup_index_for_genome(genome)
+    start = int(min(max(0, warmup), n_close - 2))
+    end = n_close
+
+    n_eff = end - start
+    k = int(max(2, folds))
+    if n_eff < k * int(min_fold_bars):
+        # Reduce folds automatically if series is short.
+        k = max(2, n_eff // int(min_fold_bars))
+    if k < 2:
+        return {"error": "cv_too_short"}
+
+    seg = n_eff // k
+    if seg < int(min_fold_bars):
+        return {"error": "cv_fold_too_short", "seg": int(seg), "k": int(k), "n_eff": int(n_eff)}
+
+    fold_sh = []
+    fold_sh_d1 = []
+    fold_sh_cost = []
+    fold_ret = []
+    fold_start_end = []
+
+    pos_folds = 0
+
+    for i in range(k):
+        a = start + i * seg
+        b = start + (i + 1) * seg if i < k - 1 else end
+        if b - a < int(min_fold_bars):
+            continue
+        if b - a < 6:
+            continue
+
+        pos_seg = pos[a:b]
+        ret_seg = ret[a : (b - 1)]
+
+        # base
+        pnl, _trade = pnl_from_positions(pos_seg, ret_seg, costs, cost_multiplier=1.0)
+        m = metrics_from_pnl(pnl, bar_seconds, mdd_floor=mdd_floor, calmar_cap=calmar_cap)
+        if "error" in m:
+            continue
+
+        # delay stress
+        pos_d = _apply_delay(pos_seg, int(delay_bars))
+        pnl_d, _ = pnl_from_positions(pos_d, ret_seg, costs, cost_multiplier=1.0)
+        m_d = metrics_from_pnl(pnl_d, bar_seconds, mdd_floor=mdd_floor, calmar_cap=calmar_cap)
+        if "error" in m_d:
+            continue
+
+        # cost stress
+        pnl_c, _ = pnl_from_positions(pos_seg, ret_seg, costs, cost_multiplier=float(stress_cost_mult))
+        m_c = metrics_from_pnl(pnl_c, bar_seconds, mdd_floor=mdd_floor, calmar_cap=calmar_cap)
+        if "error" in m_c:
+            continue
+
+        sh = float(m.get("sharpe", 0.0))
+        sh_d = float(m_d.get("sharpe", 0.0))
+        sh_c = float(m_c.get("sharpe", 0.0))
+        rt = float(m.get("total_return", 0.0))
+
+        fold_sh.append(sh)
+        fold_sh_d1.append(sh_d)
+        fold_sh_cost.append(sh_c)
+        fold_ret.append(rt)
+        fold_start_end.append((int(a), int(b)))
+
+        if rt > 0:
+            pos_folds += 1
+
+    if len(fold_sh) < 2:
+        return {"error": "cv_insufficient_folds", "folds_ok": int(len(fold_sh)), "k": int(k)}
+
+    fold_sh_np = np.asarray(fold_sh, dtype=np.float64)
+    fold_sh_d_np = np.asarray(fold_sh_d1, dtype=np.float64)
+    fold_sh_c_np = np.asarray(fold_sh_cost, dtype=np.float64)
+
+    summary = {
+        "n_folds": int(len(fold_sh)),
+        "fold_start_end": fold_start_end,
+        "positive_folds": int(pos_folds),
+        "median_sharpe": float(np.median(fold_sh_np)),
+        "min_sharpe": float(np.min(fold_sh_np)),
+        "std_sharpe": float(np.std(fold_sh_np)) if fold_sh_np.size > 1 else 0.0,
+        "median_sharpe_delay1": float(np.median(fold_sh_d_np)),
+        "median_sharpe_coststress": float(np.median(fold_sh_c_np)),
+        "fold_sharpes": [float(x) for x in fold_sh],
+        "fold_sharpes_delay1": [float(x) for x in fold_sh_d1],
+        "fold_sharpes_coststress": [float(x) for x in fold_sh_cost],
+        "fold_total_returns": [float(x) for x in fold_ret],
+        "warmup": int(warmup),
+        "delay_bars": int(delay_bars),
+        "stress_cost_mult": float(stress_cost_mult),
+    }
+    return summary
+
+
+def _score_v3(
+    m_train: dict[str, Any],
+    m_hold: dict[str, Any],
+    m_hold_stress: dict[str, Any],
     wf: dict[str, Any],
-    tt: dict[str, Any],
-    th: dict[str, Any],
+    trade_train: dict[str, Any],
+    trade_hold: dict[str, Any],
+    cv: dict[str, Any],
 ) -> float:
     """
-    OOS-first scoring.
+    CV-first score. The aim is to reduce "one block lucky" dominance.
     """
-    train_sh = float(mt.get("sharpe", 0.0))
-    hold_sh = float(mh.get("sharpe", 0.0))
-    stress_sh = float(mh_stress.get("sharpe", 0.0))
-
-    hold_cal = float(mh.get("calmar", 0.0))
-    hold_mdd = abs(float(mh.get("max_drawdown", 0.0)))
-    train_mdd = abs(float(mt.get("max_drawdown", 0.0)))
+    train_sh = float(m_train.get("sharpe", 0.0))
+    hold_sh = float(m_hold.get("sharpe", 0.0))
+    stress_sh = float(m_hold_stress.get("sharpe", 0.0))
 
     gap = max(0.0, train_sh - hold_sh)
 
-    nseg = int(wf.get("n_segments", 1))
-    posseg = int(wf.get("positive_segments", 0))
-    stability = posseg / max(1, nseg)
+    cv_med = float(cv.get("median_sharpe", 0.0))
+    cv_min = float(cv.get("min_sharpe", 0.0))
+    cv_std = float(cv.get("std_sharpe", 0.0))
+    cv_med_d = float(cv.get("median_sharpe_delay1", 0.0))
+    cv_med_c = float(cv.get("median_sharpe_coststress", 0.0))
+
+    pos_folds = int(cv.get("positive_folds", 0))
+    n_folds = int(max(1, cv.get("n_folds", 1)))
+    pos_frac = pos_folds / n_folds
 
     dominance = abs(float(wf.get("dominance", 1.0)))
-    turnover = float(tt.get("turnover_mean", 0.0))
-    exp_h = float(th.get("exposure", 0.0))
+    turnover = float(trade_train.get("turnover_mean", 0.0))
+    hold_mdd = abs(float(m_hold.get("max_drawdown", 0.0)))
 
     s = (
-        0.55 * hold_sh +
-        0.20 * train_sh +
-        0.15 * stress_sh +
-        0.10 * hold_cal
+        0.55 * cv_med +
+        0.20 * cv_min +
+        0.12 * cv_med_d +
+        0.08 * cv_med_c +
+        0.05 * stress_sh +
+        0.05 * hold_sh
     )
-    s *= (0.75 + 0.25 * stability)
-    s -= 0.35 * gap
-    s -= 0.22 * hold_mdd + 0.06 * (-train_mdd)
+    s *= (0.85 + 0.15 * pos_frac)
+    s -= 0.22 * cv_std
+    s -= 0.22 * gap
+    s -= 0.14 * hold_mdd
     s -= 0.05 * turnover
-    s += 0.10 * min(exp_h, 0.60)
-    s -= 0.15 * max(0.0, dominance - 0.60)
+    s -= 0.12 * max(0.0, dominance - 0.60)
     return float(s)
 
 
 def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) -> list[dict[str, Any]]:
-    """
-    Executed inside worker.
-    Returns list of accepted strategies with metrics + score.
-    """
     global _G_CLOSE, _G_RET, _G_BAR_SECONDS, _G_FEATS
     if _G_CLOSE is None or _G_RET is None or _G_FEATS is None:
         raise RuntimeError("Worker not initialized with dataset")
@@ -294,7 +446,7 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
 
             pos = _positions_from_alpha(alpha, genome["threshold"], mask)
 
-            # --- Train ---
+            # --- Stage 1: Train ---
             pos_train = pos[: split_close + 1]
             pnl_train, trade_train = pnl_from_positions(pos_train, train_ret, eval_cfg.costs, cost_multiplier=1.0)
             m_train = metrics_from_pnl(
@@ -343,7 +495,7 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
                 calmar_cap=eval_cfg.calmar_cap,
             )
 
-            # --- Holdout (OOS) ---
+            # --- Stage 1: Holdout (OOS) ---
             pos_hold = pos[split_close:]
             pnl_hold, trade_hold = pnl_from_positions(pos_hold, holdout_ret, eval_cfg.costs, cost_multiplier=1.0)
             m_hold = metrics_from_pnl(
@@ -411,7 +563,57 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
                 },
             }
 
-            score = _score_v2(m_train, m_hold, m_hold_stress, wf, trade_train, trade_hold)
+            # --- Stage 2: Deep Validation (Time-block CV) ---
+            pass_flags = "train+wf+holdout+stress"
+            cv_summary = None
+
+            if bool(eval_cfg.deep_validation) and int(eval_cfg.cv_folds) >= 2:
+                cv_summary = _timeblock_cv(
+                    pos=pos,
+                    ret=ret,
+                    bar_seconds=bar_seconds,
+                    genome=genome,
+                    costs=eval_cfg.costs,
+                    stress_cost_mult=eval_cfg.stress_cost_mult,
+                    folds=int(eval_cfg.cv_folds),
+                    delay_bars=int(eval_cfg.cv_delay_bars),
+                    min_fold_bars=int(eval_cfg.cv_min_fold_bars),
+                    mdd_floor=eval_cfg.mdd_floor,
+                    calmar_cap=eval_cfg.calmar_cap,
+                )
+                if "error" in cv_summary:
+                    continue
+
+                # gates
+                n_folds_ok = int(cv_summary.get("n_folds", 0))
+                pos_folds = int(cv_summary.get("positive_folds", 0))
+
+                min_pos = int(eval_cfg.cv_min_positive_folds)
+                if min_pos <= 0:
+                    min_pos = int(math.ceil(float(eval_cfg.cv_min_positive_folds_frac) * float(n_folds_ok)))
+                min_pos = max(1, min(min_pos, n_folds_ok))
+
+                if pos_folds < min_pos:
+                    continue
+
+                if float(cv_summary.get("min_sharpe", -1e9)) < float(eval_cfg.cv_min_sharpe):
+                    continue
+                if float(cv_summary.get("median_sharpe", -1e9)) < float(eval_cfg.cv_min_median_sharpe_base):
+                    continue
+                if float(cv_summary.get("median_sharpe_delay1", -1e9)) < float(eval_cfg.cv_min_median_sharpe_delay1):
+                    continue
+                if float(cv_summary.get("median_sharpe_coststress", -1e9)) < float(eval_cfg.cv_min_median_sharpe_coststress):
+                    continue
+
+                metrics["cv"] = cv_summary
+                pass_flags = "train+wf+holdout+stress+cv"
+
+            # score (v3 uses cv if available; otherwise fallback to holdout-centric)
+            if cv_summary is not None and "error" not in cv_summary:
+                score = _score_v3(m_train, m_hold, m_hold_stress, wf, trade_train, trade_hold, cv_summary)
+            else:
+                # fallback (rare; only when deep_validation disabled)
+                score = 0.55 * float(m_hold.get("sharpe", 0.0)) + 0.25 * float(m_train.get("sharpe", 0.0)) - 0.15 * max(0.0, float(m_train.get("sharpe", 0.0)) - float(m_hold.get("sharpe", 0.0)))
 
             strat_hash = stable_hash({"genome_v": 1, "genome": genome})
             out.append(
@@ -420,7 +622,7 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
                     "genome": genome,
                     "metrics": metrics,
                     "score": float(score),
-                    "pass_flags": "train+wf+holdout+stress",
+                    "pass_flags": pass_flags,
                 }
             )
         except Exception:

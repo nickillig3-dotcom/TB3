@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SQLite persistence for Strategy‑Miner (Patch 0003).
+SQLite persistence for Strategy‑Miner (Patch 0004)
 
-Patch 0003 adds:
-- eval_id (evaluation config/version hash) so results are comparable & queryable even after we change gating/scoring.
-- schema migration from Patch 0002 table layout to the new layout.
+Patch 0004: No schema changes.
+We only enhance top_strategies() to parse metrics_json["cv"] summary for display.
 
-We keep WAL mode for speed.
+Schema is Patch 0003 (eval_id versioned).
 """
 
 from __future__ import annotations
@@ -100,24 +99,18 @@ def _get_user_version(con: sqlite3.Connection) -> int:
 
 def _migrate_from_patch0002(con: sqlite3.Connection) -> None:
     """
-    Patch 0002 schema had:
-      strategies(strategy_hash, dataset_id) primary key, no eval_id, different columns.
-    We rebuild strategies table with eval_id and copy legacy rows with eval_id='legacy_v1'.
+    Patch 0002 schema migration (kept from Patch 0003).
     """
     if not _table_exists(con, "strategies"):
         return
 
     cols = _table_columns(con, "strategies")
     if "eval_id" in cols:
-        return  # already migrated
+        return
 
-    # Ensure other tables exist
     con.executescript(SCHEMA_SQL_V3)
-
-    # Rename old table
     con.execute("ALTER TABLE strategies RENAME TO strategies_old;")
 
-    # Create new table
     con.executescript("""
     CREATE TABLE IF NOT EXISTS strategies (
       strategy_hash TEXT NOT NULL,
@@ -153,9 +146,7 @@ def _migrate_from_patch0002(con: sqlite3.Connection) -> None:
     CREATE INDEX IF NOT EXISTS idx_strat_created ON strategies(dataset_id, eval_id, created_utc DESC);
     """)
 
-    # Copy legacy data best-effort
     old_cols = _table_columns(con, "strategies_old")
-
     select_cols = []
     for c in ["strategy_hash","dataset_id","created_utc","run_id","genome_json","metrics_json","pass_flags","score",
               "sharpe","calmar","max_drawdown","trades","turnover","exposure"]:
@@ -216,7 +207,6 @@ def _migrate_from_patch0002(con: sqlite3.Connection) -> None:
 
     con.execute("DROP TABLE strategies_old;")
 
-    # Runs table may be missing eval_id column in legacy DB
     if _table_exists(con, "runs"):
         run_cols = _table_columns(con, "runs")
         if "eval_id" not in run_cols:
@@ -259,10 +249,6 @@ def latest_eval_id(con: sqlite3.Connection, dataset_id: str) -> str | None:
 
 
 class DBWriter:
-    """
-    Single-writer helper to avoid opening a new sqlite connection per insert.
-    """
-
     def __init__(self, db_path: str, *, commit_every: int = 50, commit_seconds: float = 2.0):
         self.db_path = db_path
         self.con = connect(db_path)
@@ -376,7 +362,13 @@ class DBWriter:
         self.maybe_commit()
 
 
-def top_strategies(db_path: str, dataset_id: str, *, limit: int = 20, eval_id: str | None = None) -> tuple[str | None, list[dict[str, Any]]]:
+def top_strategies(
+    db_path: str,
+    dataset_id: str,
+    *,
+    limit: int = 20,
+    eval_id: str | None = None,
+) -> tuple[str | None, list[dict[str, Any]]]:
     con = connect(db_path)
     try:
         init_db(db_path)
@@ -396,7 +388,8 @@ def top_strategies(db_path: str, dataset_id: str, *, limit: int = 20, eval_id: s
                    train_calmar, holdout_calmar,
                    holdout_max_drawdown,
                    trades_holdout, turnover_holdout, exposure_holdout,
-                   created_utc, genome_json
+                   created_utc, genome_json,
+                   metrics_json
             FROM strategies
             WHERE dataset_id=? AND eval_id=?
             ORDER BY score DESC
@@ -406,6 +399,13 @@ def top_strategies(db_path: str, dataset_id: str, *, limit: int = 20, eval_id: s
         )
         rows = []
         for r in cur.fetchall():
+            metrics = {}
+            try:
+                metrics = json.loads(r[12]) if r[12] else {}
+            except Exception:
+                metrics = {}
+
+            cv = metrics.get("cv", {}) if isinstance(metrics, dict) else {}
             rows.append(
                 {
                     "strategy_hash": r[0],
@@ -420,6 +420,14 @@ def top_strategies(db_path: str, dataset_id: str, *, limit: int = 20, eval_id: s
                     "exposure_holdout": r[9],
                     "created_utc": r[10],
                     "genome": json.loads(r[11]),
+                    # CV summary (Patch 0004)
+                    "cv_median_sharpe": cv.get("median_sharpe"),
+                    "cv_min_sharpe": cv.get("min_sharpe"),
+                    "cv_std_sharpe": cv.get("std_sharpe"),
+                    "cv_pos_folds": cv.get("positive_folds"),
+                    "cv_n_folds": cv.get("n_folds"),
+                    "cv_med_delay1": cv.get("median_sharpe_delay1"),
+                    "cv_med_cost": cv.get("median_sharpe_coststress"),
                 }
             )
         return str(eval_id), rows
@@ -427,7 +435,13 @@ def top_strategies(db_path: str, dataset_id: str, *, limit: int = 20, eval_id: s
         con.close()
 
 
-def load_strategy_genome(db_path: str, dataset_id: str, *, eval_id: str | None, strategy_hash: str) -> tuple[str | None, dict[str, Any] | None]:
+def load_strategy_genome(
+    db_path: str,
+    dataset_id: str,
+    *,
+    eval_id: str | None,
+    strategy_hash: str,
+) -> tuple[str | None, dict[str, Any] | None]:
     con = connect(db_path)
     try:
         init_db(db_path)
