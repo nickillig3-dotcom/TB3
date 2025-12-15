@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Strategy‑Miner entrypoint (Patch 0002)
+Strategy‑Miner entrypoint (Patch 0003)
 
-Usage examples:
-
-  # Run on synthetic demo data for 1 minute
-  python strategy_miner.py --demo --minutes 1
-
-  # Run for 30 seconds, fewer bars (faster for sanity check)
-  python strategy_miner.py --demo --minutes 0.5 --demo-bars 40000
-
-  # Show top strategies from last run (for the dataset_id)
-  python strategy_miner.py --show-top 20
-
-  # Use your own CSV (must have at least 'close' column)
-  python strategy_miner.py --csv path/to/data.csv --minutes 3
-
-Notes:
-- This is research-only; no execution/broker integration.
-- The database is local SQLite (strategy_results.sqlite by default).
+Patch 0003 upgrades:
+- OOS (train/holdout) evaluation + stronger overfitting filters
+- eval_id versioning in SQLite
+- show-top defaults to latest eval_id for the dataset
 """
 
 from __future__ import annotations
@@ -41,7 +28,7 @@ from sm_utils import (
 from data_cache import prepare_demo_dataset, prepare_csv_dataset
 from bt_eval import safe_bar_seconds
 from results_db import DBWriter, top_strategies
-from research_engine import ResearchConfig, run_research
+from research_engine import ResearchConfig, EvalConfig, eval_id_from_eval_cfg, run_research
 
 
 def _parse_args() -> argparse.Namespace:
@@ -56,30 +43,49 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--batch", type=int, default=0, help="Strategies per worker task (0=auto)")
     p.add_argument("--inflight", type=int, default=0, help="Max tasks in flight (0=auto)")
 
+    # Demo settings
     p.add_argument("--demo-bars", type=int, default=120_000, help="Number of bars for demo dataset")
     p.add_argument("--demo-bar-seconds", type=int, default=60 * 15, help="Bar seconds for demo dataset")
     p.add_argument("--seed", type=int, default=1234, help="RNG seed for search")
 
+    # Eval controls (Patch 0003)
+    p.add_argument("--holdout-frac", type=float, default=0.20, help="Holdout fraction (last x%%) for OOS")
+    p.add_argument("--min-exposure-train", type=float, default=0.02, help="Min exposure in train slice")
+    p.add_argument("--min-exposure-holdout", type=float, default=0.01, help="Min exposure in holdout slice")
+    p.add_argument("--min-trades-train", type=int, default=60, help="Min trades in train slice")
+    p.add_argument("--min-trades-holdout", type=int, default=10, help="Min trades in holdout slice")
+    p.add_argument("--stress-cost-mult", type=float, default=3.0, help="Cost multiplier for stress test")
+
     p.add_argument("--force-rebuild-cache", action="store_true", help="Rebuild dataset cache even if present")
+
+    # DB browsing
     p.add_argument("--show-top", type=int, default=0, help="Show top N strategies and exit")
-    p.add_argument("--dataset-id", type=str, default=None, help="(with --show-top) override dataset_id")
+    p.add_argument("--dataset-id", type=str, default=None, help="(with --show-top) dataset_id to query")
+    p.add_argument("--eval-id", type=str, default=None, help="(optional) eval_id to query. Default: latest for dataset.")
     return p.parse_args()
 
 
-def _format_top(rows: list[dict], limit: int) -> str:
+def _format_top(rows: list[dict], limit: int, eval_id: str | None) -> str:
     if not rows:
-        return "(no strategies stored yet for this dataset_id)"
+        return "(no strategies stored yet for this dataset/eval_id)"
     lines = []
+    lines.append(f"eval_id: {eval_id}")
     lines.append(f"Top {min(limit, len(rows))} strategies:")
-    lines.append("-" * 110)
-    lines.append(f"{'rank':>4}  {'score':>8}  {'sharpe':>8}  {'calmar':>8}  {'mdd':>8}  {'trades':>8}  {'turn':>8}  {'exp':>6}  hash")
-    lines.append("-" * 110)
+    lines.append("-" * 140)
+    lines.append(
+        f"{'rank':>4}  {'score':>8}  {'tr_sh':>7}  {'ho_sh':>7}  {'ho_cal':>7}  {'ho_mdd':>7}  "
+        f"{'ho_tr':>6}  {'ho_turn':>7}  {'ho_exp':>6}  hash"
+    )
+    lines.append("-" * 140)
     for i, r in enumerate(rows[:limit], 1):
         lines.append(
-            f"{i:>4}  {r['score']:>8.3f}  {r.get('sharpe',0):>8.3f}  {r.get('calmar',0):>8.3f}  {r.get('max_drawdown',0):>8.3f}  "
-            f"{int(r.get('trades') or 0):>8d}  {float(r.get('turnover') or 0):>8.3f}  {float(r.get('exposure') or 0):>6.2f}  {r['strategy_hash'][:12]}"
+            f"{i:>4}  {r['score']:>8.3f}  "
+            f"{float(r.get('train_sharpe') or 0):>7.3f}  {float(r.get('holdout_sharpe') or 0):>7.3f}  "
+            f"{float(r.get('holdout_calmar') or 0):>7.3f}  {float(r.get('holdout_max_drawdown') or 0):>7.3f}  "
+            f"{int(r.get('trades_holdout') or 0):>6d}  {float(r.get('turnover_holdout') or 0):>7.3f}  {float(r.get('exposure_holdout') or 0):>6.2f}  "
+            f"{r['strategy_hash'][:12]}"
         )
-    lines.append("-" * 110)
+    lines.append("-" * 140)
     top = rows[0]
     lines.append("Best genome (compact):")
     lines.append(str(top["genome"]))
@@ -89,9 +95,7 @@ def _format_top(rows: list[dict], limit: int) -> str:
 def main() -> int:
     args = _parse_args()
 
-    # Avoid numpy/BLAS oversubscription with process pool
     set_thread_env(threads=1)
-
     ensure_dir("logs")
 
     run_tag = local_ts()
@@ -101,10 +105,13 @@ def main() -> int:
         run_path=os.path.join("logs", f"research_{run_tag}.log"),
     )
 
-    # Show-top mode with explicit dataset-id (no dataset preparation needed)
-    if args.show_top and args.show_top > 0 and args.dataset_id:
-        rows = top_strategies(args.db, str(args.dataset_id), limit=int(args.show_top))
-        print(_format_top(rows, int(args.show_top)))
+    # show-top mode
+    if args.show_top and args.show_top > 0:
+        if not args.dataset_id:
+            print("ERROR: --show-top requires --dataset-id")
+            return 2
+        eval_id, rows = top_strategies(args.db, str(args.dataset_id), limit=int(args.show_top), eval_id=args.eval_id)
+        print(_format_top(rows, int(args.show_top), eval_id))
         return 0
 
     # Prepare dataset cache
@@ -118,19 +125,13 @@ def main() -> int:
             force_rebuild=args.force_rebuild_cache,
         )
 
-    # infer bar_seconds for CSV if possible
+    # Infer bar_seconds for CSV if possible
     bar_seconds = int(cache.meta.get("bar_seconds") or 0)
     if bar_seconds <= 0:
         ts = np.load(cache.ts_path, mmap_mode="r")
         bar_seconds = safe_bar_seconds(ts, default_bar_seconds=int(args.demo_bar_seconds))
 
     dataset_id = cache.dataset_id
-
-    # Show-top mode (derives dataset-id from current dataset selection)
-    if args.show_top and args.show_top > 0:
-        rows = top_strategies(args.db, dataset_id, limit=int(args.show_top))
-        print(_format_top(rows, int(args.show_top)))
-        return 0
 
     # Determine worker count
     rec_workers = get_recommended_workers_from_capabilities("capabilities_latest.json")
@@ -143,27 +144,55 @@ def main() -> int:
     batch = int(args.batch) if int(args.batch) > 0 else int(64 if workers <= 4 else 96)
     inflight = int(args.inflight) if int(args.inflight) > 0 else int(max(2, workers * 2))
 
-    logger.info("=== Strategy‑Miner (Patch 0002) ===")
+    # Build eval config
+    eval_cfg = EvalConfig(
+        holdout_frac=float(args.holdout_frac),
+        stress_cost_mult=float(args.stress_cost_mult),
+        min_exposure_train=float(args.min_exposure_train),
+        min_exposure_holdout=float(args.min_exposure_holdout),
+        min_trades_train=int(args.min_trades_train),
+        min_trades_holdout=int(args.min_trades_holdout),
+    )
+    eval_id = eval_id_from_eval_cfg(eval_cfg)
+
+    logger.info("=== Strategy‑Miner (Patch 0003) ===")
     logger.info(f"dataset_id: {dataset_id}")
+    logger.info(f"eval_id: {eval_id}")
     logger.info(f"cache.ts_path: {cache.ts_path}")
     logger.info(f"cache.ohlcv_path: {cache.ohlcv_path}")
     logger.info(f"bars: {cache.meta.get('n_bars')} | bar_seconds: {bar_seconds}")
     logger.info(f"db: {args.db}")
     logger.info(f"workers: {workers} | batch: {batch} | inflight: {inflight} | minutes: {args.minutes}")
+    logger.info(
+        f"holdout_frac={eval_cfg.holdout_frac} | min_exp_train={eval_cfg.min_exposure_train} | "
+        f"min_exp_holdout={eval_cfg.min_exposure_holdout} | min_trades_train={eval_cfg.min_trades_train} | "
+        f"min_trades_holdout={eval_cfg.min_trades_holdout} | stress_cost_mult={eval_cfg.stress_cost_mult}"
+    )
 
-    # DB writer
+    # DB writer (auto-migrates schema)
     dbw = DBWriter(args.db, commit_every=50, commit_seconds=2.0)
     run_id = f"run_{run_tag}"
     dbw.insert_run(
         run_id=run_id,
         mode="research",
         dataset_id=dataset_id,
+        eval_id=eval_id,
         config={
             "minutes": float(args.minutes),
             "workers": workers,
             "batch": batch,
             "inflight": inflight,
             "seed": int(args.seed),
+            "eval_id": eval_id,
+            "eval_cfg": {
+                "holdout_frac": eval_cfg.holdout_frac,
+                "min_exposure_train": eval_cfg.min_exposure_train,
+                "min_exposure_holdout": eval_cfg.min_exposure_holdout,
+                "min_trades_train": eval_cfg.min_trades_train,
+                "min_trades_holdout": eval_cfg.min_trades_holdout,
+                "stress_cost_mult": eval_cfg.stress_cost_mult,
+                "score_version": eval_cfg.score_version,
+            },
         },
     )
 
@@ -176,6 +205,7 @@ def main() -> int:
         dbw.upsert_strategy(
             strategy_hash=r["strategy_hash"],
             dataset_id=dataset_id,
+            eval_id=eval_id,
             run_id=run_id,
             genome=r["genome"],
             metrics=r["metrics"],
@@ -207,6 +237,7 @@ def main() -> int:
         max_in_flight=int(inflight),
         seed=int(args.seed),
         mode="research",
+        eval_cfg=eval_cfg,
     )
 
     try:
@@ -220,9 +251,8 @@ def main() -> int:
         f"rate={summary['tested_per_sec']:.1f}/s | best_score={summary['best_score']:.3f} | seconds={summary['seconds']:.1f}"
     )
 
-    # Print top 10 after run
-    rows = top_strategies(args.db, dataset_id, limit=10)
-    print(_format_top(rows, 10))
+    _eval_id, rows = top_strategies(args.db, dataset_id, limit=10, eval_id=eval_id)
+    print(_format_top(rows, 10, _eval_id))
     return 0
 
 
