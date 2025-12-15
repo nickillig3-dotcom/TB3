@@ -1,0 +1,117 @@
+{
+  "artifacts": {
+    "capabilities_latest_json": "C:\\TB3.1\\capabilities_latest.json",
+    "capabilities_run_json": "C:\\TB3.1\\capabilities_20251215_185331_dc8e3477.json",
+    "log_latest": "C:\\TB3.1\\logs\\benchmark_latest.log",
+    "log_run": "C:\\TB3.1\\logs\\benchmark_20251215_185331_dc8e3477.log"
+  },
+  "benchmarks": {
+    "cpu_multi_core_scaling": {
+      "iters_per_task": 1821967,
+      "max_workers": 8,
+      "results": [
+        {
+          "elapsed_seconds": 1.076107500004582,
+          "iters_per_second_total": 1693108.727513043,
+          "total_iters": 1821967,
+          "workers": 1
+        },
+        {
+          "elapsed_seconds": 1.2585948000196368,
+          "iters_per_second_total": 2895239.9930010415,
+          "total_iters": 3643934,
+          "workers": 2
+        },
+        {
+          "elapsed_seconds": 1.314095199923031,
+          "iters_per_second_total": 5545920.874246298,
+          "total_iters": 7287868,
+          "workers": 4
+        },
+        {
+          "elapsed_seconds": 1.8424632999813184,
+          "iters_per_second_total": 7911004.794585482,
+          "total_iters": 14575736,
+          "workers": 8
+        }
+      ]
+    },
+    "cpu_single_core": {
+      "iters": 1821967,
+      "iters_per_second": 1736658.01657966,
+      "median_seconds": 1.0491225000005215,
+      "trial_seconds": [
+        0.9998275999678299,
+        1.0675222999416292,
+        1.0600042999722064,
+        0.9709219000069425,
+        1.0491225000005215
+      ],
+      "trials": 5
+    },
+    "disk_sequential_io": {
+      "chunk_bytes": 8388608,
+      "dir": "C:\\TB3.1",
+      "file_size_bytes": 536870912,
+      "read_mb_s": 1826.883518569623,
+      "read_seconds": 0.28025870001874864,
+      "write_mb_s": 367.50025821353785,
+      "write_seconds": 1.3931963000213727
+    },
+    "numpy_vector_hint": {
+      "approx_effective_gb_s": 2.2891150283833794,
+      "elapsed_seconds": 0.624919000081718,
+      "numpy_version": "2.3.5",
+      "reps": 8,
+      "sentinel": 7.9999991999999995,
+      "vector_len": 8000000
+    }
+  },
+  "cpu": {
+    "logical_cores": 8,
+    "physical_cores": 4
+  },
+  "disk": {
+    "free_bytes": 164392792064,
+    "path": "C:\\TB3.1",
+    "total_bytes": 249413234688,
+    "used_bytes": 85020442624
+  },
+  "env": {},
+  "memory": {
+    "available_bytes": 7392632832,
+    "total_bytes": 17034817536
+  },
+  "meta": {
+    "created_utc": "2025-12-15T17:53:32Z",
+    "mode": "full",
+    "patch": "0001",
+    "project": "Strategy\u2011Miner",
+    "run_id": "dc8e3477",
+    "run_ts_local": "20251215_185331"
+  },
+  "optional_libs": {
+    "numpy": true,
+    "psutil": true
+  },
+  "recommendations": {
+    "cpu_workers_near_peak": 8,
+    "cpu_workers_peak_throughput": 8,
+    "max_cpu_workers": 8,
+    "ram_budget_gb": 10.36,
+    "ram_reserve_gb": 3.0,
+    "ram_total_gb": 15.86,
+    "recommended_cpu_workers": 8,
+    "recommended_io_workers": 6
+  },
+  "system": {
+    "executable": "C:\\TB3.1\\venv\\Scripts\\python.exe",
+    "machine": "AMD64",
+    "os_name": "nt",
+    "platform": "Windows-10-10.0.19045-SP0",
+    "processor": "Intel64 Family 6 Model 94 Stepping 3, GenuineIntel",
+    "python_implementation": "CPython",
+    "python_version": "3.14.1",
+    "sys_platform": "win32"
+  }
+}
