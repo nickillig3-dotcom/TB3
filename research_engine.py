@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Strategy‑Miner Research Engine (Patch 0004)
+Strategy‑Miner Research Engine (Patch 0005)
 
-Patch 0004 upgrades:
-- Deep Validation Stage (DVS): time-block cross-validation (k folds) across (warmup..end)
-- Stress integrated into CV:
-    * base: delay=0, cost_mult=1
-    * delay stress: delay=cv_delay_bars, cost_mult=1
-    * cost stress: delay=0, cost_mult=stress_cost_mult
-- Score v3: CV-first, reduces "last-holdout lucky" domination.
-- No DB schema changes; CV summary stored in metrics_json["cv"].
-
-Research-only, no execution integration.
+Patch 0005:
+- Evolutionary search (ElitePool + mutation + crossover + seed queue)
+- CV gates v2 (min sharpe delay/cost + positive folds under cost stress)
+- Regime attribution (vol tertiles x trend tertiles => 9 regimes) stored in metrics_json["regime"]
+- Score v4 (CV-first + regime balance penalty)
+- No DB schema changes.
 """
 
 from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, asdict
+import copy
+from dataclasses import dataclass, asdict, field
 from typing import Any, Callable
+from collections import OrderedDict
 
 import numpy as np
 import multiprocessing as mp
@@ -46,13 +44,14 @@ _G_VOLUME: np.ndarray | None = None
 _G_RET: np.ndarray | None = None
 _G_BAR_SECONDS: int = 86400
 _G_FEATS: FeatureStore | None = None
+_G_REGIME_CACHE: dict[tuple[int, int], dict[str, Any]] | None = None
 
 
 def _worker_init(ts_path: str, ohlcv_path: str, bar_seconds: int) -> None:
     """
     Worker initializer: load dataset memmaps once per process.
     """
-    global _G_CLOSE, _G_VOLUME, _G_RET, _G_BAR_SECONDS, _G_FEATS
+    global _G_CLOSE, _G_VOLUME, _G_RET, _G_BAR_SECONDS, _G_FEATS, _G_REGIME_CACHE
 
     ohlcv = np.load(ohlcv_path, mmap_mode="r")
     _G_CLOSE = ohlcv[:, 3].astype(np.float64, copy=False)
@@ -61,7 +60,8 @@ def _worker_init(ts_path: str, ohlcv_path: str, bar_seconds: int) -> None:
 
     _G_RET = compute_simple_returns(_G_CLOSE)
     _G_BAR_SECONDS = int(bar_seconds)
-    _G_FEATS = FeatureStore(close=_G_CLOSE, volume=_G_VOLUME, simple_ret=_G_RET, max_cache_items=32)
+    _G_FEATS = FeatureStore(close=_G_CLOSE, volume=_G_VOLUME, simple_ret=_G_RET, max_cache_items=48)
+    _G_REGIME_CACHE = {}  # lazy per (vol_window, trend_window)
 
 
 # -----------------------------
@@ -84,7 +84,7 @@ class SearchSpace:
 @dataclass(frozen=True)
 class EvalConfig:
     # --- Identity ---
-    score_version: str = "score_v3_cv"
+    score_version: str = "score_v4_cv_regime"
 
     # --- Costs ---
     costs: BacktestCosts = BacktestCosts(cost_bps=1.0, slippage_bps=0.5)
@@ -125,17 +125,28 @@ class EvalConfig:
     deep_validation: bool = True
     cv_folds: int = 5
     cv_delay_bars: int = 1
-
-    # fold geometry
     cv_min_fold_bars: int = 800
 
-    # gates
+    # v1 gates
     cv_min_positive_folds_frac: float = 0.60
     cv_min_positive_folds: int = 0  # if >0 overrides frac rule
     cv_min_sharpe: float = -0.20
     cv_min_median_sharpe_base: float = 0.20
     cv_min_median_sharpe_delay1: float = 0.10
     cv_min_median_sharpe_coststress: float = 0.05
+
+    # v2 gates (new)
+    cv_min_sharpe_delay1: float = -0.10
+    cv_min_sharpe_coststress: float = -0.10
+    cv_min_positive_folds_coststress_frac: float = 0.60
+    cv_min_positive_folds_coststress: int = 0
+
+    # --- Regime attribution (new) ---
+    regime_enabled: bool = True
+    regime_vol_window: int = 160
+    regime_trend_window: int = 160
+    regime_min_bars: int = 600
+    regime_min_exposure: float = 0.03
 
 
 def eval_id_from_eval_cfg(eval_cfg: EvalConfig) -> str:
@@ -160,9 +171,298 @@ class ResearchConfig:
     search_space: SearchSpace = SearchSpace()
     eval_cfg: EvalConfig = EvalConfig()
 
+    # --- Search controls (Patch 0005) ---
+    search_mode: str = "evo"          # "random" | "evo"
+    elite_size: int = 512
+    elite_seed_genomes: list[dict[str, Any]] = field(default_factory=list)
+    seen_max: int = 200_000
+
+    evo_frac_random: float = 0.35
+    evo_frac_mutate: float = 0.50
+    evo_frac_crossover: float = 0.15
+
 
 # -----------------------------
-# Strategy generator
+# Search / Evo
+# -----------------------------
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return float(min(max(x, lo), hi))
+
+
+def _genome_fingerprint(genome: dict[str, Any]) -> int:
+    """
+    Cheap in-run fingerprint to avoid duplicates. Not persisted.
+    """
+    try:
+        parts = genome.get("features", []) or []
+        parts_t = tuple(sorted(
+            (str(p.get("name")), int(p.get("window")), round(float(p.get("weight")), 4))
+            for p in parts
+        ))
+        gate = genome.get("vol_gate", {}) or {}
+        fp = (
+            str(genome.get("type")),
+            parts_t,
+            round(float(genome.get("threshold")), 4),
+            str(gate.get("mode", "any")),
+            int(gate.get("window", 0)),
+        )
+        return hash(fp)
+    except Exception:
+        return hash(("bad",))
+
+
+class ElitePool:
+    def __init__(self, max_size: int, rng: np.random.Generator):
+        self.max_size = int(max(8, max_size))
+        self.rng = rng
+        self.items: list[tuple[float, dict[str, Any], int]] = []  # (score, genome, fp)
+        self._fps: set[int] = set()
+
+    def add(self, score: float, genome: dict[str, Any]) -> None:
+        fp = _genome_fingerprint(genome)
+        if fp in self._fps:
+            return
+        self.items.append((float(score), genome, fp))
+        self._fps.add(fp)
+        self.items.sort(key=lambda x: x[0], reverse=True)
+        if len(self.items) > self.max_size:
+            # drop tail
+            for _, _, fpt in self.items[self.max_size:]:
+                self._fps.discard(fpt)
+            self.items = self.items[: self.max_size]
+
+    def size(self) -> int:
+        return int(len(self.items))
+
+    def best_score(self) -> float:
+        return float(self.items[0][0]) if self.items else -1e9
+
+    def sample(self) -> dict[str, Any] | None:
+        if not self.items:
+            return None
+        n = len(self.items)
+        # rank weights: top gets most
+        w = np.arange(n, 0, -1, dtype=np.float64)
+        p = w / w.sum()
+        idx = int(self.rng.choice(n, p=p))
+        return self.items[idx][1]
+
+
+class CandidateGenerator:
+    def __init__(
+        self,
+        rng: np.random.Generator,
+        space: SearchSpace,
+        *,
+        mode: str,
+        elite_size: int,
+        seen_max: int,
+        frac_random: float,
+        frac_mutate: float,
+        frac_crossover: float,
+        seed_genomes: list[dict[str, Any]] | None = None,
+    ):
+        self.rng = rng
+        self.space = space
+        self.mode = str(mode).lower().strip()
+        self.elite = ElitePool(max_size=int(elite_size), rng=rng)
+
+        self.seen_max = int(max(10_000, seen_max))
+        self.seen = OrderedDict()  # fp -> None (insertion ordered)
+
+        # mixture
+        s = max(1e-9, float(frac_random) + float(frac_mutate) + float(frac_crossover))
+        self.frac_random = float(frac_random) / s
+        self.frac_mutate = float(frac_mutate) / s
+        self.frac_crossover = float(frac_crossover) / s
+
+        # seed queue: evaluated early
+        self.seed_queue: list[dict[str, Any]] = list(seed_genomes or [])
+
+    def _seen_add(self, fp: int) -> bool:
+        if fp in self.seen:
+            return False
+        self.seen[fp] = None
+        if len(self.seen) > self.seen_max:
+            self.seen.popitem(last=False)
+        return True
+
+    def _random_genome(self) -> dict[str, Any]:
+        return generate_genomes(self.rng, 1, self.space)[0]
+
+    def _mutate(self, parent: dict[str, Any]) -> dict[str, Any]:
+        g = copy.deepcopy(parent)
+        wins = list(self.space.windows)
+        feats = list(self.space.features)
+
+        # weight jitter
+        if self.rng.random() < 0.95:
+            for p in g.get("features", []):
+                w = float(p.get("weight", 0.0))
+                w += float(self.rng.normal(0.0, 0.20))
+                p["weight"] = _clamp(w, -self.space.weight_abs_max, self.space.weight_abs_max)
+
+        # threshold jitter
+        if self.rng.random() < 0.75:
+            thr = float(g.get("threshold", 0.5))
+            thr += float(self.rng.normal(0.0, 0.08))
+            g["threshold"] = _clamp(thr, self.space.threshold_min, self.space.threshold_max)
+
+        # window mutate
+        if self.rng.random() < 0.45 and g.get("features"):
+            i = int(self.rng.integers(0, len(g["features"])))
+            w0 = int(g["features"][i].get("window", wins[0]))
+            if w0 in wins:
+                j = wins.index(w0)
+                j2 = int(_clamp(j + int(self.rng.choice([-1, 1])), 0, len(wins) - 1))
+                g["features"][i]["window"] = int(wins[j2])
+            else:
+                g["features"][i]["window"] = int(self.rng.choice(wins))
+
+        # feature swap (rare)
+        if self.rng.random() < 0.18 and g.get("features"):
+            i = int(self.rng.integers(0, len(g["features"])))
+            existing = {str(p.get("name")) for p in g["features"]}
+            cand = [f for f in feats if f not in existing]
+            if cand:
+                g["features"][i]["name"] = str(self.rng.choice(cand))
+
+        # gate mutate
+        if self.rng.random() < 0.25:
+            gate = g.get("vol_gate", {}) or {}
+            if self.rng.random() < 0.5:
+                gate["mode"] = str(self.rng.choice(list(self.space.vol_gate_modes)))
+            if self.rng.random() < 0.7:
+                gate["window"] = int(self.rng.choice(list(self.space.vol_gate_windows)))
+            g["vol_gate"] = gate
+
+        # keep type
+        g["type"] = "linear_alpha_v1"
+        return g
+
+    def _crossover(self, a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+        wins = list(self.space.windows)
+        feats = list(self.space.features)
+
+        # merge (name, window) keys
+        def parts_map(g: dict[str, Any]) -> dict[tuple[str, int], float]:
+            m = {}
+            for p in g.get("features", []):
+                k = (str(p.get("name")), int(p.get("window")))
+                m[k] = float(p.get("weight", 0.0))
+            return m
+
+        ma = parts_map(a)
+        mb = parts_map(b)
+        keys = list(set(ma.keys()) | set(mb.keys()))
+        if not keys:
+            return self._random_genome()
+
+        k = int(self.rng.integers(self.space.n_features_min, self.space.n_features_max + 1))
+        if len(keys) < k:
+            # pad with random keys
+            while len(keys) < k:
+                keys.append((str(self.rng.choice(feats)), int(self.rng.choice(wins))))
+        keys = list(set(keys))
+        self.rng.shuffle(keys)
+        keys = keys[:k]
+
+        child_parts = []
+        for (name, w) in keys:
+            wa = ma.get((name, w), None)
+            wb = mb.get((name, w), None)
+
+            # IMPORTANT: If we padded keys with random (name, window), it may exist in neither parent.
+            if wa is None and wb is None:
+                weight = float(self.rng.uniform(-self.space.weight_abs_max, self.space.weight_abs_max)) * 0.6
+            elif wa is not None and wb is not None:
+                weight = 0.5 * (wa + wb) + float(self.rng.normal(0.0, 0.10))
+            elif wa is not None:
+                weight = wa + float(self.rng.normal(0.0, 0.10))
+            else:
+                weight = wb + float(self.rng.normal(0.0, 0.10))
+
+            weight = _clamp(weight, -self.space.weight_abs_max, self.space.weight_abs_max)
+            child_parts.append({"name": name, "window": int(w), "weight": float(weight)})
+
+            weight = _clamp(weight, -self.space.weight_abs_max, self.space.weight_abs_max)
+            child_parts.append({"name": name, "window": int(w), "weight": float(weight)})
+
+        thr = 0.5 * (float(a.get("threshold", 0.5)) + float(b.get("threshold", 0.5)))
+        thr += float(self.rng.normal(0.0, 0.06))
+        thr = _clamp(thr, self.space.threshold_min, self.space.threshold_max)
+
+        gate = (a.get("vol_gate") if self.rng.random() < 0.5 else b.get("vol_gate")) or {"mode": "any", "window": 80}
+        # small gate mutate
+        if self.rng.random() < 0.20:
+            gate = dict(gate)
+            if self.rng.random() < 0.5:
+                gate["mode"] = str(self.rng.choice(list(self.space.vol_gate_modes)))
+            if self.rng.random() < 0.7:
+                gate["window"] = int(self.rng.choice(list(self.space.vol_gate_windows)))
+
+        return {"type": "linear_alpha_v1", "features": child_parts, "threshold": float(thr), "vol_gate": gate}
+
+    def next_batch(self, n: int) -> list[dict[str, Any]]:
+        n = int(max(1, n))
+        out: list[dict[str, Any]] = []
+
+        # consume seeds first (evaluate old elites under new eval_cfg)
+        while self.seed_queue and len(out) < n:
+            g = self.seed_queue.pop(0)
+            fp = _genome_fingerprint(g)
+            if self._seen_add(fp):
+                out.append(g)
+
+        if self.mode == "random":
+            while len(out) < n:
+                g = self._random_genome()
+                fp = _genome_fingerprint(g)
+                if self._seen_add(fp):
+                    out.append(g)
+            return out
+
+        # evo
+        max_tries = 25 * n
+        tries = 0
+        while len(out) < n and tries < max_tries:
+            tries += 1
+            u = float(self.rng.random())
+
+            if u < self.frac_random or self.elite.size() < 8:
+                g = self._random_genome()
+            elif u < self.frac_random + self.frac_mutate:
+                parent = self.elite.sample()
+                g = self._mutate(parent) if parent is not None else self._random_genome()
+            else:
+                p1 = self.elite.sample()
+                p2 = self.elite.sample()
+                if p1 is None or p2 is None:
+                    g = self._random_genome()
+                else:
+                    g = self._crossover(p1, p2)
+
+            fp = _genome_fingerprint(g)
+            if self._seen_add(fp):
+                out.append(g)
+
+        # fallback fill
+        while len(out) < n:
+            g = self._random_genome()
+            fp = _genome_fingerprint(g)
+            if self._seen_add(fp):
+                out.append(g)
+
+        return out
+
+    def update_elite(self, score: float, genome: dict[str, Any]) -> None:
+        self.elite.add(float(score), genome)
+
+
+# -----------------------------
+# Strategy generator (random base)
 # -----------------------------
 
 def generate_genomes(rng: np.random.Generator, n: int, space: SearchSpace) -> list[dict[str, Any]]:
@@ -213,9 +513,6 @@ def _split_index(n_close: int, holdout_frac: float) -> int:
 
 
 def _warmup_index_for_genome(genome: dict[str, Any]) -> int:
-    """
-    Approx warmup to avoid evaluating long initial NaN/invalid region.
-    """
     try:
         ws = [int(p.get("window", 1)) for p in genome.get("features", [])]
         gate = genome.get("vol_gate", {}) or {}
@@ -235,6 +532,169 @@ def _apply_delay(pos_seg: np.ndarray, delay_bars: int) -> np.ndarray:
     return out
 
 
+def _rolling_mean(x: np.ndarray, w: int, out_len: int) -> np.ndarray:
+    w = int(max(1, w))
+    out = np.full(int(out_len), np.nan, dtype=np.float64)
+    if x.size < w:
+        return out
+    c = np.cumsum(np.insert(x.astype(np.float64, copy=False), 0, 0.0))
+    m = (c[w:] - c[:-w]) / float(w)  # length x.size - w + 1
+    # align: mean of last w returns ends at ret index t-1 => close index t
+    start = w
+    end = start + m.size
+    if end > out.size:
+        end = out.size
+        m = m[: (end - start)]
+    if start < out.size and m.size > 0:
+        out[start:end] = m
+    return out
+
+
+def _get_or_build_regime_cache(vol_window: int, trend_window: int) -> dict[str, Any]:
+    global _G_REGIME_CACHE, _G_FEATS, _G_RET, _G_CLOSE
+    assert _G_REGIME_CACHE is not None
+    key = (int(vol_window), int(trend_window))
+    if key in _G_REGIME_CACHE:
+        return _G_REGIME_CACHE[key]
+
+    if _G_FEATS is None or _G_RET is None or _G_CLOSE is None:
+        _G_REGIME_CACHE[key] = {"regime": None, "info": {"error": "no_data"}}
+        return _G_REGIME_CACHE[key]
+
+    n_close = int(_G_CLOSE.shape[0])
+
+    try:
+        vol = _G_FEATS.get("vol_s", int(vol_window)).astype(np.float64, copy=False)
+    except Exception:
+        vol = np.full(n_close, np.nan, dtype=np.float64)
+
+    trend = _rolling_mean(_G_RET, int(trend_window), out_len=n_close)
+
+    # quantile bins
+    def _tertile_bins(x: np.ndarray) -> tuple[np.ndarray, float, float]:
+        x = x.astype(np.float64, copy=False)
+        m = np.isfinite(x)
+        bins = np.full(x.shape[0], -1, dtype=np.int8)
+        if m.sum() < 200:
+            return bins, float("nan"), float("nan")
+        q1, q2 = np.nanquantile(x[m], [1/3, 2/3])
+        bins[(x <= q1) & m] = 0
+        bins[(x > q1) & (x <= q2) & m] = 1
+        bins[(x > q2) & m] = 2
+        return bins, float(q1), float(q2)
+
+    vb, vq1, vq2 = _tertile_bins(vol)
+    tb, tq1, tq2 = _tertile_bins(trend)
+
+    regime = np.full(n_close, -1, dtype=np.int8)
+    ok = (vb >= 0) & (tb >= 0)
+    regime[ok] = (vb[ok] * 3 + tb[ok]).astype(np.int8)
+
+    info = {
+        "vol_window": int(vol_window),
+        "trend_window": int(trend_window),
+        "vol_q33": vq1, "vol_q66": vq2,
+        "trend_q33": tq1, "trend_q66": tq2,
+        "bars_unknown": int((regime < 0).sum()),
+    }
+    _G_REGIME_CACHE[key] = {"regime": regime, "info": info}
+    return _G_REGIME_CACHE[key]
+
+
+def _regime_attribution(
+    pos: np.ndarray,
+    pnl_full: np.ndarray,
+    regime: np.ndarray,
+    bar_seconds: int,
+    *,
+    min_bars: int,
+    min_exposure: float,
+) -> dict[str, Any]:
+    """
+    Compute contribution + exposure per regime over full series.
+    regime is per close index (len = n_close), pnl_full is per return (len=n_close-1).
+    """
+    n_close = int(pos.shape[0])
+    if pnl_full.shape[0] != n_close - 1:
+        return {"error": "regime_shape_mismatch"}
+
+    reg = regime[:-1]
+    m_ok = (reg >= 0)
+    pos_use = pos[:-1]
+    active = (pos_use != 0)
+
+    ann_factor = (365.25 * 24.0 * 3600.0) / float(max(1, bar_seconds))
+    sqrt_ann = float(math.sqrt(ann_factor))
+
+    rows = []
+    pos_pnl_sums = []
+    total_pos_pnl = 0.0
+
+    coverage = 0
+    worst_sh = None
+
+    for rid in range(9):
+        mask = (reg == rid) & m_ok
+        bars = int(mask.sum())
+        if bars <= 0:
+            rows.append({
+                "rid": int(rid),
+                "vol_bin": int(rid // 3),
+                "trend_bin": int(rid % 3),
+                "bars": 0,
+                "active_bars": 0,
+                "exposure": 0.0,
+                "pnl_sum": 0.0,
+                "pnl_mean": 0.0,
+                "sharpe": 0.0,
+            })
+            continue
+
+        active_bars = int((active & mask).sum())
+        exposure = float(active_bars) / float(max(1, bars))
+
+        pnl_slice = pnl_full[mask]
+        pnl_sum = float(np.sum(pnl_slice))
+        pnl_mean = pnl_sum / float(max(1, bars))
+        pnl_std = float(np.std(pnl_slice)) if pnl_slice.size > 1 else 0.0
+        sharpe = float((pnl_mean / pnl_std) * sqrt_ann) if pnl_std > 1e-12 else 0.0
+
+        if bars >= int(min_bars) and exposure >= float(min_exposure):
+            coverage += 1
+            if worst_sh is None:
+                worst_sh = sharpe
+            else:
+                worst_sh = min(worst_sh, sharpe)
+
+        pos_contrib = max(0.0, pnl_sum)
+        pos_pnl_sums.append(pos_contrib)
+        total_pos_pnl += pos_contrib
+
+        rows.append({
+            "rid": int(rid),
+            "vol_bin": int(rid // 3),
+            "trend_bin": int(rid % 3),
+            "bars": int(bars),
+            "active_bars": int(active_bars),
+            "exposure": float(exposure),
+            "pnl_sum": float(pnl_sum),
+            "pnl_mean": float(pnl_mean),
+            "sharpe": float(sharpe),
+        })
+
+    dominance = float(max(pos_pnl_sums) / total_pos_pnl) if total_pos_pnl > 1e-12 and pos_pnl_sums else 0.0
+    if worst_sh is None:
+        worst_sh = 0.0
+
+    return {
+        "n_regimes": 9,
+        "coverage": int(coverage),
+        "dominance": float(dominance),
+        "worst_sharpe": float(worst_sh),
+        "rows": rows,
+    }
+
+
 def _timeblock_cv(
     pos: np.ndarray,
     ret: np.ndarray,
@@ -250,7 +710,7 @@ def _timeblock_cv(
     calmar_cap: float,
 ) -> dict[str, Any]:
     """
-    Returns CV summary + small fold vectors.
+    Returns CV summary + fold vectors.
     Uses close-index folds on range [warmup..N).
     """
     n_close = int(pos.shape[0])
@@ -264,7 +724,6 @@ def _timeblock_cv(
     n_eff = end - start
     k = int(max(2, folds))
     if n_eff < k * int(min_fold_bars):
-        # Reduce folds automatically if series is short.
         k = max(2, n_eff // int(min_fold_bars))
     if k < 2:
         return {"error": "cv_too_short"}
@@ -276,10 +735,13 @@ def _timeblock_cv(
     fold_sh = []
     fold_sh_d1 = []
     fold_sh_cost = []
-    fold_ret = []
+    fold_rt = []
+    fold_rt_d1 = []
+    fold_rt_cost = []
     fold_start_end = []
 
     pos_folds = 0
+    pos_folds_cost = 0
 
     for i in range(k):
         a = start + i * seg
@@ -292,20 +754,17 @@ def _timeblock_cv(
         pos_seg = pos[a:b]
         ret_seg = ret[a : (b - 1)]
 
-        # base
-        pnl, _trade = pnl_from_positions(pos_seg, ret_seg, costs, cost_multiplier=1.0)
+        pnl, _ = pnl_from_positions(pos_seg, ret_seg, costs, cost_multiplier=1.0)
         m = metrics_from_pnl(pnl, bar_seconds, mdd_floor=mdd_floor, calmar_cap=calmar_cap)
         if "error" in m:
             continue
 
-        # delay stress
         pos_d = _apply_delay(pos_seg, int(delay_bars))
         pnl_d, _ = pnl_from_positions(pos_d, ret_seg, costs, cost_multiplier=1.0)
         m_d = metrics_from_pnl(pnl_d, bar_seconds, mdd_floor=mdd_floor, calmar_cap=calmar_cap)
         if "error" in m_d:
             continue
 
-        # cost stress
         pnl_c, _ = pnl_from_positions(pos_seg, ret_seg, costs, cost_multiplier=float(stress_cost_mult))
         m_c = metrics_from_pnl(pnl_c, bar_seconds, mdd_floor=mdd_floor, calmar_cap=calmar_cap)
         if "error" in m_c:
@@ -314,37 +773,57 @@ def _timeblock_cv(
         sh = float(m.get("sharpe", 0.0))
         sh_d = float(m_d.get("sharpe", 0.0))
         sh_c = float(m_c.get("sharpe", 0.0))
+
         rt = float(m.get("total_return", 0.0))
+        rt_d = float(m_d.get("total_return", 0.0))
+        rt_c = float(m_c.get("total_return", 0.0))
 
         fold_sh.append(sh)
         fold_sh_d1.append(sh_d)
         fold_sh_cost.append(sh_c)
-        fold_ret.append(rt)
+
+        fold_rt.append(rt)
+        fold_rt_d1.append(rt_d)
+        fold_rt_cost.append(rt_c)
+
         fold_start_end.append((int(a), int(b)))
 
         if rt > 0:
             pos_folds += 1
+        if rt_c > 0:
+            pos_folds_cost += 1
 
     if len(fold_sh) < 2:
         return {"error": "cv_insufficient_folds", "folds_ok": int(len(fold_sh)), "k": int(k)}
 
-    fold_sh_np = np.asarray(fold_sh, dtype=np.float64)
-    fold_sh_d_np = np.asarray(fold_sh_d1, dtype=np.float64)
-    fold_sh_c_np = np.asarray(fold_sh_cost, dtype=np.float64)
+    sh0 = np.asarray(fold_sh, dtype=np.float64)
+    sh1 = np.asarray(fold_sh_d1, dtype=np.float64)
+    shc = np.asarray(fold_sh_cost, dtype=np.float64)
 
     summary = {
         "n_folds": int(len(fold_sh)),
         "fold_start_end": fold_start_end,
         "positive_folds": int(pos_folds),
-        "median_sharpe": float(np.median(fold_sh_np)),
-        "min_sharpe": float(np.min(fold_sh_np)),
-        "std_sharpe": float(np.std(fold_sh_np)) if fold_sh_np.size > 1 else 0.0,
-        "median_sharpe_delay1": float(np.median(fold_sh_d_np)),
-        "median_sharpe_coststress": float(np.median(fold_sh_c_np)),
+        "positive_folds_coststress": int(pos_folds_cost),
+
+        "median_sharpe": float(np.median(sh0)),
+        "min_sharpe": float(np.min(sh0)),
+        "std_sharpe": float(np.std(sh0)) if sh0.size > 1 else 0.0,
+
+        "median_sharpe_delay1": float(np.median(sh1)),
+        "min_sharpe_delay1": float(np.min(sh1)),
+
+        "median_sharpe_coststress": float(np.median(shc)),
+        "min_sharpe_coststress": float(np.min(shc)),
+
         "fold_sharpes": [float(x) for x in fold_sh],
         "fold_sharpes_delay1": [float(x) for x in fold_sh_d1],
         "fold_sharpes_coststress": [float(x) for x in fold_sh_cost],
-        "fold_total_returns": [float(x) for x in fold_ret],
+
+        "fold_total_returns": [float(x) for x in fold_rt],
+        "fold_total_returns_delay1": [float(x) for x in fold_rt_d1],
+        "fold_total_returns_coststress": [float(x) for x in fold_rt_cost],
+
         "warmup": int(warmup),
         "delay_bars": int(delay_bars),
         "stress_cost_mult": float(stress_cost_mult),
@@ -352,7 +831,7 @@ def _timeblock_cv(
     return summary
 
 
-def _score_v3(
+def _score_v4(
     m_train: dict[str, Any],
     m_hold: dict[str, Any],
     m_hold_stress: dict[str, Any],
@@ -360,9 +839,10 @@ def _score_v3(
     trade_train: dict[str, Any],
     trade_hold: dict[str, Any],
     cv: dict[str, Any],
+    regime: dict[str, Any] | None,
 ) -> float:
     """
-    CV-first score. The aim is to reduce "one block lucky" dominance.
+    CV-first score + regime balance penalty.
     """
     train_sh = float(m_train.get("sharpe", 0.0))
     hold_sh = float(m_hold.get("sharpe", 0.0))
@@ -380,29 +860,41 @@ def _score_v3(
     n_folds = int(max(1, cv.get("n_folds", 1)))
     pos_frac = pos_folds / n_folds
 
-    dominance = abs(float(wf.get("dominance", 1.0)))
+    dominance_wf = abs(float(wf.get("dominance", 1.0)))
     turnover = float(trade_train.get("turnover_mean", 0.0))
     hold_mdd = abs(float(m_hold.get("max_drawdown", 0.0)))
 
     s = (
         0.55 * cv_med +
-        0.20 * cv_min +
-        0.12 * cv_med_d +
+        0.22 * cv_min +
+        0.10 * cv_med_d +
         0.08 * cv_med_c +
         0.05 * stress_sh +
-        0.05 * hold_sh
+        0.04 * hold_sh
     )
     s *= (0.85 + 0.15 * pos_frac)
     s -= 0.22 * cv_std
     s -= 0.22 * gap
-    s -= 0.14 * hold_mdd
+    s -= 0.12 * hold_mdd
     s -= 0.05 * turnover
-    s -= 0.12 * max(0.0, dominance - 0.60)
+    s -= 0.12 * max(0.0, dominance_wf - 0.60)
+
+    # regime adjustments
+    if regime and "error" not in regime:
+        cov = float(regime.get("coverage", 0.0)) / 9.0
+        dom = float(regime.get("dominance", 0.0))
+        worst = float(regime.get("worst_sharpe", 0.0))
+
+        s += 0.10 * cov
+        s -= 0.25 * max(0.0, dom - 0.55)
+        s -= 0.08 * max(0.0, (-worst) - 0.20)
+
     return float(s)
 
 
 def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) -> list[dict[str, Any]]:
     global _G_CLOSE, _G_RET, _G_BAR_SECONDS, _G_FEATS
+
     if _G_CLOSE is None or _G_RET is None or _G_FEATS is None:
         raise RuntimeError("Worker not initialized with dataset")
 
@@ -421,6 +913,15 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
         return []
     if holdout_ret.size < int(eval_cfg.min_holdout_bars):
         return []
+
+    # regime cache (lazy)
+    regime_cache = None
+    regime_arr = None
+    regime_info = None
+    if bool(eval_cfg.regime_enabled):
+        regime_cache = _get_or_build_regime_cache(int(eval_cfg.regime_vol_window), int(eval_cfg.regime_trend_window))
+        regime_arr = regime_cache.get("regime", None)
+        regime_info = (regime_cache.get("info", {}) or {})
 
     out: list[dict[str, Any]] = []
 
@@ -449,12 +950,7 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
             # --- Stage 1: Train ---
             pos_train = pos[: split_close + 1]
             pnl_train, trade_train = pnl_from_positions(pos_train, train_ret, eval_cfg.costs, cost_multiplier=1.0)
-            m_train = metrics_from_pnl(
-                pnl_train,
-                bar_seconds,
-                mdd_floor=eval_cfg.mdd_floor,
-                calmar_cap=eval_cfg.calmar_cap,
-            )
+            m_train = metrics_from_pnl(pnl_train, bar_seconds, mdd_floor=eval_cfg.mdd_floor, calmar_cap=eval_cfg.calmar_cap)
             if "error" in m_train:
                 continue
 
@@ -472,8 +968,7 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
                 continue
 
             wf = walkforward_metrics(
-                pnl_train,
-                bar_seconds,
+                pnl_train, bar_seconds,
                 n_splits=eval_cfg.n_walkforward_splits,
                 mdd_floor=eval_cfg.mdd_floor,
                 calmar_cap=eval_cfg.calmar_cap,
@@ -487,8 +982,7 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
 
             active_mask_train = (pos_train[:-1] != 0)
             m_train_active = metrics_from_pnl_masked(
-                pnl_train,
-                active_mask_train,
+                pnl_train, active_mask_train,
                 bar_seconds,
                 min_bars=max(50, int(0.02 * pnl_train.size)),
                 mdd_floor=eval_cfg.mdd_floor,
@@ -498,12 +992,7 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
             # --- Stage 1: Holdout (OOS) ---
             pos_hold = pos[split_close:]
             pnl_hold, trade_hold = pnl_from_positions(pos_hold, holdout_ret, eval_cfg.costs, cost_multiplier=1.0)
-            m_hold = metrics_from_pnl(
-                pnl_hold,
-                bar_seconds,
-                mdd_floor=eval_cfg.mdd_floor,
-                calmar_cap=eval_cfg.calmar_cap,
-            )
+            m_hold = metrics_from_pnl(pnl_hold, bar_seconds, mdd_floor=eval_cfg.mdd_floor, calmar_cap=eval_cfg.calmar_cap)
             if "error" in m_hold:
                 continue
 
@@ -520,18 +1009,8 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
             if m_hold["sharpe"] < eval_cfg.min_holdout_sharpe:
                 continue
 
-            pnl_hold_s, _ = pnl_from_positions(
-                pos_hold,
-                holdout_ret,
-                eval_cfg.costs,
-                cost_multiplier=eval_cfg.stress_cost_mult,
-            )
-            m_hold_stress = metrics_from_pnl(
-                pnl_hold_s,
-                bar_seconds,
-                mdd_floor=eval_cfg.mdd_floor,
-                calmar_cap=eval_cfg.calmar_cap,
-            )
+            pnl_hold_s, _ = pnl_from_positions(pos_hold, holdout_ret, eval_cfg.costs, cost_multiplier=eval_cfg.stress_cost_mult)
+            m_hold_stress = metrics_from_pnl(pnl_hold_s, bar_seconds, mdd_floor=eval_cfg.mdd_floor, calmar_cap=eval_cfg.calmar_cap)
             if "error" in m_hold_stress:
                 continue
             if m_hold_stress["sharpe"] < eval_cfg.min_holdout_stress_sharpe:
@@ -539,8 +1018,7 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
 
             active_mask_hold = (pos_hold[:-1] != 0)
             m_hold_active = metrics_from_pnl_masked(
-                pnl_hold,
-                active_mask_hold,
+                pnl_hold, active_mask_hold,
                 bar_seconds,
                 min_bars=max(40, int(0.02 * pnl_hold.size)),
                 mdd_floor=eval_cfg.mdd_floor,
@@ -563,15 +1041,13 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
                 },
             }
 
-            # --- Stage 2: Deep Validation (Time-block CV) ---
+            # --- Stage 2: CV (Deep Validation) ---
             pass_flags = "train+wf+holdout+stress"
             cv_summary = None
 
             if bool(eval_cfg.deep_validation) and int(eval_cfg.cv_folds) >= 2:
                 cv_summary = _timeblock_cv(
-                    pos=pos,
-                    ret=ret,
-                    bar_seconds=bar_seconds,
+                    pos=pos, ret=ret, bar_seconds=bar_seconds,
                     genome=genome,
                     costs=eval_cfg.costs,
                     stress_cost_mult=eval_cfg.stress_cost_mult,
@@ -584,18 +1060,18 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
                 if "error" in cv_summary:
                     continue
 
-                # gates
                 n_folds_ok = int(cv_summary.get("n_folds", 0))
                 pos_folds = int(cv_summary.get("positive_folds", 0))
 
+                # positive folds (base)
                 min_pos = int(eval_cfg.cv_min_positive_folds)
                 if min_pos <= 0:
                     min_pos = int(math.ceil(float(eval_cfg.cv_min_positive_folds_frac) * float(n_folds_ok)))
                 min_pos = max(1, min(min_pos, n_folds_ok))
-
                 if pos_folds < min_pos:
                     continue
 
+                # base gates
                 if float(cv_summary.get("min_sharpe", -1e9)) < float(eval_cfg.cv_min_sharpe):
                     continue
                 if float(cv_summary.get("median_sharpe", -1e9)) < float(eval_cfg.cv_min_median_sharpe_base):
@@ -605,26 +1081,59 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
                 if float(cv_summary.get("median_sharpe_coststress", -1e9)) < float(eval_cfg.cv_min_median_sharpe_coststress):
                     continue
 
+                # v2 gates
+                if float(cv_summary.get("min_sharpe_delay1", -1e9)) < float(eval_cfg.cv_min_sharpe_delay1):
+                    continue
+                if float(cv_summary.get("min_sharpe_coststress", -1e9)) < float(eval_cfg.cv_min_sharpe_coststress):
+                    continue
+
+                pos_folds_cost = int(cv_summary.get("positive_folds_coststress", 0))
+                min_pos_cost = int(eval_cfg.cv_min_positive_folds_coststress)
+                if min_pos_cost <= 0:
+                    min_pos_cost = int(math.ceil(float(eval_cfg.cv_min_positive_folds_coststress_frac) * float(n_folds_ok)))
+                min_pos_cost = max(1, min(min_pos_cost, n_folds_ok))
+                if pos_folds_cost < min_pos_cost:
+                    continue
+
                 metrics["cv"] = cv_summary
                 pass_flags = "train+wf+holdout+stress+cv"
 
-            # score (v3 uses cv if available; otherwise fallback to holdout-centric)
+            # --- Regime attribution (new) ---
+            regime_metrics = None
+            if bool(eval_cfg.regime_enabled) and regime_arr is not None:
+                try:
+                    pnl_full = np.concatenate([pnl_train, pnl_hold])
+                    regime_metrics = _regime_attribution(
+                        pos=pos,
+                        pnl_full=pnl_full,
+                        regime=regime_arr,
+                        bar_seconds=bar_seconds,
+                        min_bars=int(eval_cfg.regime_min_bars),
+                        min_exposure=float(eval_cfg.regime_min_exposure),
+                    )
+                    if regime_info:
+                        regime_metrics = dict(regime_metrics)
+                        regime_metrics["info"] = regime_info
+                    metrics["regime"] = regime_metrics
+                    pass_flags += "+regime"
+                except Exception:
+                    pass
+
+            # --- Score v4 ---
             if cv_summary is not None and "error" not in cv_summary:
-                score = _score_v3(m_train, m_hold, m_hold_stress, wf, trade_train, trade_hold, cv_summary)
+                score = _score_v4(m_train, m_hold, m_hold_stress, wf, trade_train, trade_hold, cv_summary, regime_metrics)
             else:
-                # fallback (rare; only when deep_validation disabled)
-                score = 0.55 * float(m_hold.get("sharpe", 0.0)) + 0.25 * float(m_train.get("sharpe", 0.0)) - 0.15 * max(0.0, float(m_train.get("sharpe", 0.0)) - float(m_hold.get("sharpe", 0.0)))
+                # fallback (deep_validation disabled)
+                score = 0.55 * float(m_hold.get("sharpe", 0.0)) + 0.25 * float(m_train.get("sharpe", 0.0))
 
             strat_hash = stable_hash({"genome_v": 1, "genome": genome})
-            out.append(
-                {
-                    "strategy_hash": strat_hash,
-                    "genome": genome,
-                    "metrics": metrics,
-                    "score": float(score),
-                    "pass_flags": pass_flags,
-                }
-            )
+            out.append({
+                "strategy_hash": strat_hash,
+                "genome": genome,
+                "metrics": metrics,
+                "score": float(score),
+                "pass_flags": pass_flags,
+            })
         except Exception:
             continue
 
@@ -656,6 +1165,21 @@ def run_research(
 
     ctx = mp.get_context("spawn")
 
+    cand = CandidateGenerator(
+        rng=rng,
+        space=cfg.search_space,
+        mode=str(cfg.search_mode),
+        elite_size=int(cfg.elite_size),
+        seen_max=int(cfg.seen_max),
+        frac_random=float(cfg.evo_frac_random),
+        frac_mutate=float(cfg.evo_frac_mutate),
+        frac_crossover=float(cfg.evo_frac_crossover),
+        seed_genomes=list(cfg.elite_seed_genomes),
+    )
+    # also seed elite pool (low score placeholders) so mutate/crossover works immediately
+    for g in cfg.elite_seed_genomes[: min(128, len(cfg.elite_seed_genomes))]:
+        cand.update_elite(score=0.0, genome=g)
+
     with ProcessPoolExecutor(
         max_workers=int(cfg.workers),
         mp_context=ctx,
@@ -667,7 +1191,9 @@ def run_research(
 
         while time.time() < deadline:
             while len(pending) < max_in_flight and time.time() < deadline:
-                genomes = generate_genomes(rng, cfg.batch_size, cfg.search_space)
+                genomes = cand.next_batch(cfg.batch_size)
+                if not genomes:
+                    break
                 fut = ex.submit(evaluate_genomes_batch, genomes, cfg.eval_cfg)
                 pending.add(fut)
                 total_tested += len(genomes)
@@ -681,23 +1207,26 @@ def run_research(
 
                 for r in results:
                     total_accepted += 1
-                    best_score = max(best_score, float(r.get("score", -1e9)))
+                    sc = float(r.get("score", -1e9))
+                    best_score = max(best_score, sc)
+                    cand.update_elite(sc, r["genome"])
                     on_result(r)
 
             now = time.time()
             if on_progress is not None and (now - last_report) >= 2.5:
                 dt = max(1e-9, now - t0)
-                on_progress(
-                    {
-                        "ts": utc_now_iso(),
-                        "tested": total_tested,
-                        "accepted": total_accepted,
-                        "tested_per_sec": total_tested / dt,
-                        "accepted_pct": (total_accepted / max(1, total_tested)) * 100.0,
-                        "best_score": best_score,
-                        "in_flight": len(pending),
-                    }
-                )
+                on_progress({
+                    "ts": utc_now_iso(),
+                    "tested": total_tested,
+                    "accepted": total_accepted,
+                    "tested_per_sec": total_tested / dt,
+                    "accepted_pct": (total_accepted / max(1, total_tested)) * 100.0,
+                    "best_score": best_score,
+                    "in_flight": len(pending),
+                    "elite_size": cand.elite.size(),
+                    "elite_best": cand.elite.best_score(),
+                    "seen": len(cand.seen),
+                })
                 last_report = now
 
         if pending:
@@ -709,7 +1238,9 @@ def run_research(
                     continue
                 for r in results:
                     total_accepted += 1
-                    best_score = max(best_score, float(r.get("score", -1e9)))
+                    sc = float(r.get("score", -1e9))
+                    best_score = max(best_score, sc)
+                    cand.update_elite(sc, r["genome"])
                     on_result(r)
 
     dt = max(1e-9, time.time() - t0)

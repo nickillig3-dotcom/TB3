@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audit_strategy.py (Patch 0004)
+audit_strategy.py (Patch 0005)
 
-Patch 0004:
-- Adds time-block CV report (same idea as engine Deep Validation Stage).
-- Still prints holdout stress table (cost multipliers + delay).
-
-Example:
-  python audit_strategy.py --db strategy_results.sqlite --dataset-id demo_40000_900_1234 --rank 1 --cv-folds 5
+Patch 0005:
+- Adds time-block CV report with clean --cv-cost-mult flag
+- Adds regime attribution table (vol tertiles x trend tertiles => 9 regimes)
 """
 
 from __future__ import annotations
@@ -56,6 +53,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--cv-folds", type=int, default=5)
     p.add_argument("--cv-delay", type=int, default=1)
     p.add_argument("--cv-min-fold-bars", type=int, default=800)
+    p.add_argument("--cv-cost-mult", type=float, default=3.0)
+
+    # Regime
+    p.add_argument("--regime-vol-window", type=int, default=160)
+    p.add_argument("--regime-trend-window", type=int, default=160)
+    p.add_argument("--regime-min-bars", type=int, default=600)
+    p.add_argument("--regime-min-exp", type=float, default=0.03)
 
     return p.parse_args()
 
@@ -93,6 +97,20 @@ def _apply_delay(pos_seg: np.ndarray, delay_bars: int) -> np.ndarray:
         return pos_seg
     out = np.roll(pos_seg, d).copy()
     out[:d] = 0
+    return out
+
+
+def _rolling_mean(x: np.ndarray, w: int, out_len: int) -> np.ndarray:
+    w = int(max(1, w))
+    out = np.full(int(out_len), np.nan, dtype=np.float64)
+    if x.size < w:
+        return out
+    c = np.cumsum(np.insert(x.astype(np.float64, copy=False), 0, 0.0))
+    m = (c[w:] - c[:-w]) / float(w)
+    start = w
+    end = min(out.size, start + m.size)
+    if end > start:
+        out[start:end] = m[: (end - start)]
     return out
 
 
@@ -170,10 +188,9 @@ def _eval_holdout_suite(
     m_train = metrics_from_pnl(pnl_train, bar_seconds, mdd_floor=mdd_floor, calmar_cap=calmar_cap)
     wf = walkforward_metrics(pnl_train, bar_seconds, n_splits=4, mdd_floor=mdd_floor, calmar_cap=calmar_cap)
 
-    # holdout (reset)
+    # holdout
     pos_hold = pos[split_close:]
     ret_hold = ret[split_close:]
-
     pos_hold = _apply_delay(pos_hold, int(delay_bars))
 
     pnl_hold, trade_hold = pnl_from_positions(pos_hold, ret_hold, costs, cost_multiplier=cost_mult)
@@ -201,6 +218,10 @@ def _eval_holdout_suite(
         "train_active": am_train,
         "holdout_active": am_hold,
         "train_wf": wf,
+        "pos": pos,
+        "ret": ret,
+        "pnl_train": pnl_train,
+        "pnl_hold": pnl_hold,
     }
 
 
@@ -241,12 +262,13 @@ def _timeblock_cv_report(
     sh_d = []
     sh_c = []
     rets = []
+    rets_c = []
     pos_folds = 0
+    pos_folds_cost = 0
 
     for i in range(k):
         a = start + i * seg
         b = start + (i + 1) * seg if i < k - 1 else end
-
         if b - a < int(cv_min_fold_bars):
             continue
 
@@ -267,12 +289,17 @@ def _timeblock_cv_report(
         s1 = float(m_d.get("sharpe", 0.0))
         s2 = float(m_c.get("sharpe", 0.0))
         rt = float(m.get("total_return", 0.0))
+        rtc = float(m_c.get("total_return", 0.0))
 
-        sh.append(s0); sh_d.append(s1); sh_c.append(s2); rets.append(rt)
+        sh.append(s0); sh_d.append(s1); sh_c.append(s2)
+        rets.append(rt); rets_c.append(rtc)
+
         if rt > 0:
             pos_folds += 1
+        if rtc > 0:
+            pos_folds_cost += 1
 
-        rows.append((i + 1, a, b, s0, s1, s2, rt, float(m.get("max_drawdown", 0.0))))
+        rows.append((i + 1, a, b, s0, s1, s2, rt, rtc, float(m.get("max_drawdown", 0.0))))
 
     if len(sh) < 2:
         return {"error": "cv_insufficient_folds", "folds_ok": int(len(sh)), "k": int(k)}
@@ -284,16 +311,128 @@ def _timeblock_cv_report(
     return {
         "n_folds": int(len(sh)),
         "positive_folds": int(pos_folds),
+        "positive_folds_coststress": int(pos_folds_cost),
         "median_sharpe": float(np.median(sh_np)),
         "min_sharpe": float(np.min(sh_np)),
         "std_sharpe": float(np.std(sh_np)),
         "median_sharpe_delay1": float(np.median(sd_np)),
+        "min_sharpe_delay1": float(np.min(sd_np)),
         "median_sharpe_coststress": float(np.median(sc_np)),
+        "min_sharpe_coststress": float(np.min(sc_np)),
         "fold_rows": rows,
         "warmup": int(warmup),
         "seg": int(seg),
         "delay_bars": int(cv_delay),
         "stress_cost_mult": float(stress_cost_mult),
+    }
+
+
+def _compute_regime_labels(
+    close: np.ndarray,
+    volume: np.ndarray | None,
+    ret: np.ndarray,
+    *,
+    vol_window: int,
+    trend_window: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    n_close = int(close.shape[0])
+    feats = FeatureStore(close=close.astype(np.float64, copy=False), volume=volume, simple_ret=ret, max_cache_items=32)
+
+    try:
+        vol = feats.get("vol_s", int(vol_window)).astype(np.float64, copy=False)
+    except Exception:
+        vol = np.full(n_close, np.nan, dtype=np.float64)
+
+    trend = _rolling_mean(ret, int(trend_window), out_len=n_close)
+
+    def _tertile_bins(x: np.ndarray) -> tuple[np.ndarray, float, float]:
+        m = np.isfinite(x)
+        bins = np.full(x.shape[0], -1, dtype=np.int8)
+        if m.sum() < 200:
+            return bins, float("nan"), float("nan")
+        q1, q2 = np.nanquantile(x[m], [1/3, 2/3])
+        bins[(x <= q1) & m] = 0
+        bins[(x > q1) & (x <= q2) & m] = 1
+        bins[(x > q2) & m] = 2
+        return bins, float(q1), float(q2)
+
+    vb, vq1, vq2 = _tertile_bins(vol)
+    tb, tq1, tq2 = _tertile_bins(trend)
+
+    reg = np.full(n_close, -1, dtype=np.int8)
+    ok = (vb >= 0) & (tb >= 0)
+    reg[ok] = (vb[ok] * 3 + tb[ok]).astype(np.int8)
+
+    info = {
+        "vol_window": int(vol_window),
+        "trend_window": int(trend_window),
+        "vol_q33": vq1, "vol_q66": vq2,
+        "trend_q33": tq1, "trend_q66": tq2,
+        "bars_unknown": int((reg < 0).sum()),
+    }
+    return reg, info
+
+
+def _regime_report(
+    pos: np.ndarray,
+    pnl_full: np.ndarray,
+    regime: np.ndarray,
+    bar_seconds: int,
+    *,
+    min_bars: int,
+    min_exposure: float,
+) -> dict[str, Any]:
+    n_close = int(pos.shape[0])
+    if pnl_full.shape[0] != n_close - 1:
+        return {"error": "shape_mismatch"}
+
+    reg = regime[:-1]
+    ok = (reg >= 0)
+    pos_use = pos[:-1]
+    active = (pos_use != 0)
+
+    ann_factor = (365.25 * 24.0 * 3600.0) / float(max(1, bar_seconds))
+    sqrt_ann = float(math.sqrt(ann_factor))
+
+    rows = []
+    total_pos = 0.0
+    pos_contribs = []
+    coverage = 0
+    worst_sh = None
+
+    for rid in range(9):
+        m = (reg == rid) & ok
+        bars = int(m.sum())
+        if bars <= 0:
+            rows.append((rid, rid // 3, rid % 3, 0, 0, 0.0, 0.0, 0.0))
+            continue
+        act = int((active & m).sum())
+        exp = float(act) / float(max(1, bars))
+        pnl = pnl_full[m]
+        pnl_sum = float(np.sum(pnl))
+        pnl_mean = pnl_sum / float(max(1, bars))
+        pnl_std = float(np.std(pnl)) if pnl.size > 1 else 0.0
+        sh = float((pnl_mean / pnl_std) * sqrt_ann) if pnl_std > 1e-12 else 0.0
+
+        if bars >= int(min_bars) and exp >= float(min_exposure):
+            coverage += 1
+            worst_sh = sh if worst_sh is None else min(worst_sh, sh)
+
+        pc = max(0.0, pnl_sum)
+        pos_contribs.append(pc)
+        total_pos += pc
+
+        rows.append((rid, rid // 3, rid % 3, bars, act, exp, pnl_sum, sh))
+
+    dom = float(max(pos_contribs) / total_pos) if total_pos > 1e-12 and pos_contribs else 0.0
+    if worst_sh is None:
+        worst_sh = 0.0
+
+    return {
+        "coverage": int(coverage),
+        "dominance": float(dom),
+        "worst_sharpe": float(worst_sh),
+        "rows": rows,
     }
 
 
@@ -325,7 +464,7 @@ def main() -> int:
     volume = ohlcv[:, 4] if ohlcv.shape[1] >= 5 else None
 
     print("=" * 100)
-    print("AUDIT STRATEGY (Patch 0004)")
+    print("AUDIT STRATEGY (Patch 0005)")
     print(f"dataset_id: {args.dataset_id}")
     print(f"eval_id(db): {_eval_id}")
     print(f"strategy_hash: {strat_hash}")
@@ -342,6 +481,7 @@ def main() -> int:
 
     # Holdout stress table
     rows_out = []
+    base_bundle = None
     for cm in cost_mults:
         for d in delays:
             res = _eval_holdout_suite(
@@ -356,6 +496,8 @@ def main() -> int:
                 mdd_floor=float(args.mdd_floor),
                 calmar_cap=float(args.calmar_cap),
             )
+            if cm == 1.0 and d == 0:
+                base_bundle = res
             mh = res["holdout"]
             th = res["holdout_trade"]
             rows_out.append(
@@ -378,7 +520,7 @@ def main() -> int:
         volume=volume,
         bar_seconds=bar_seconds,
         costs=costs,
-        stress_cost_mult=float(args.cost_mults.split(",")[2]) if "," in args.cost_mults else 3.0,
+        stress_cost_mult=float(args.cv_cost_mult),
         cv_folds=int(args.cv_folds),
         cv_delay=int(args.cv_delay),
         cv_min_fold_bars=int(args.cv_min_fold_bars),
@@ -390,31 +532,70 @@ def main() -> int:
         print("  CV error:", cv)
     else:
         pf = f"{cv['positive_folds']}/{cv['n_folds']}"
-        print(f"  folds={cv['n_folds']} positive_folds={pf} warmup={cv['warmup']} seg={cv['seg']} delay={cv['delay_bars']}")
+        pfc = f"{cv['positive_folds_coststress']}/{cv['n_folds']}"
+        print(f"  folds={cv['n_folds']} pos_folds={pf} pos_cost_folds={pfc} warmup={cv['warmup']} seg={cv['seg']} delay={cv['delay_bars']} cost_mult={cv['stress_cost_mult']}")
         print(f"  cv_median_sharpe={cv['median_sharpe']:.3f}  cv_min_sharpe={cv['min_sharpe']:.3f}  cv_std_sharpe={cv['std_sharpe']:.3f}")
-        print(f"  cv_med_delay1={cv['median_sharpe_delay1']:.3f}  cv_med_coststress={cv['median_sharpe_coststress']:.3f}")
-        print("-" * 100)
-        print(f"{'fold':>4} {'a':>7} {'b':>7} {'sh':>8} {'sh_d1':>8} {'sh_cost':>8} {'ret':>9} {'mdd':>8}")
-        print("-" * 100)
-        for (fi, a, b, sh0, sh1, sh2, rt, mdd) in cv["fold_rows"]:
-            print(f"{fi:>4d} {a:>7d} {b:>7d} {sh0:>8.3f} {sh1:>8.3f} {sh2:>8.3f} {rt:>9.3f} {mdd:>8.3f}")
-        print("-" * 100)
+        print(f"  cv_med_delay1={cv['median_sharpe_delay1']:.3f}  cv_min_delay1={cv['min_sharpe_delay1']:.3f}")
+        print(f"  cv_med_coststress={cv['median_sharpe_coststress']:.3f}  cv_min_coststress={cv['min_sharpe_coststress']:.3f}")
+        print("-" * 110)
+        print(f"{'fold':>4} {'a':>7} {'b':>7} {'sh':>8} {'sh_d1':>8} {'sh_cost':>8} {'ret':>9} {'retC':>9} {'mdd':>8}")
+        print("-" * 110)
+        for (fi, a, b, sh0, sh1, sh2, rt, rtc, mdd) in cv["fold_rows"]:
+            print(f"{fi:>4d} {a:>7d} {b:>7d} {sh0:>8.3f} {sh1:>8.3f} {sh2:>8.3f} {rt:>9.3f} {rtc:>9.3f} {mdd:>8.3f}")
+        print("-" * 110)
 
-    # Detailed base metrics (costx=1, delay=0)
-    base_res = _eval_holdout_suite(
-        genome, close=close, volume=volume, bar_seconds=bar_seconds,
-        holdout_frac=float(args.holdout_frac), costs=costs,
-        cost_mult=1.0, delay_bars=0,
-        mdd_floor=float(args.mdd_floor), calmar_cap=float(args.calmar_cap),
-    )
+    # Detailed base metrics
+    if base_bundle is None:
+        base_bundle = _eval_holdout_suite(
+            genome, close=close, volume=volume, bar_seconds=bar_seconds,
+            holdout_frac=float(args.holdout_frac), costs=costs,
+            cost_mult=1.0, delay_bars=0,
+            mdd_floor=float(args.mdd_floor), calmar_cap=float(args.calmar_cap),
+        )
+
     print("\nDetailed metrics (costx=1.0 delay=0):")
-    print("train:", base_res["train"])
-    print("holdout:", base_res["holdout"])
-    print("train_trade:", base_res["train_trade"])
-    print("holdout_trade:", base_res["holdout_trade"])
-    print("train_active:", base_res["train_active"])
-    print("holdout_active:", base_res["holdout_active"])
-    print("train_wf:", base_res["train_wf"])
+    print("train:", base_bundle["train"])
+    print("holdout:", base_bundle["holdout"])
+    print("train_trade:", base_bundle["train_trade"])
+    print("holdout_trade:", base_bundle["holdout_trade"])
+    print("train_active:", base_bundle["train_active"])
+    print("holdout_active:", base_bundle["holdout_active"])
+    print("train_wf:", base_bundle["train_wf"])
+
+    # Regime attribution (base pnl full)
+    pos_full = base_bundle["pos"]
+    ret_full = base_bundle["ret"]
+    pnl_full = np.concatenate([base_bundle["pnl_train"], base_bundle["pnl_hold"]])
+
+    reg, reg_info = _compute_regime_labels(
+        close=close.astype(np.float64, copy=False),
+        volume=volume.astype(np.float64, copy=False) if volume is not None else None,
+        ret=ret_full,
+        vol_window=int(args.regime_vol_window),
+        trend_window=int(args.regime_trend_window),
+    )
+    rep = _regime_report(
+        pos=pos_full,
+        pnl_full=pnl_full,
+        regime=reg,
+        bar_seconds=bar_seconds,
+        min_bars=int(args.regime_min_bars),
+        min_exposure=float(args.regime_min_exp),
+    )
+
+    print("\nRegime attribution (base, full series):")
+    if "error" in rep:
+        print("  regime error:", rep)
+    else:
+        print(f"  regimes=9 coverage={rep['coverage']}/9 dominance={rep['dominance']:.3f} worst_sharpe={rep['worst_sharpe']:.3f}")
+        print(f"  vol_window={reg_info.get('vol_window')} trend_window={reg_info.get('trend_window')} bars_unknown={reg_info.get('bars_unknown')}")
+        print("-" * 110)
+        print(f"{'rid':>3} {'vol':>3} {'trd':>3} {'bars':>7} {'act':>7} {'exp':>6} {'pnl_sum':>10} {'sharpe':>8}")
+        print("-" * 110)
+        for (rid, vb, tb, bars, act, exp, pnl_sum, sh) in rep["rows"]:
+            print(f"{rid:>3d} {vb:>3d} {tb:>3d} {bars:>7d} {act:>7d} {exp:>6.2f} {pnl_sum:>10.3f} {sh:>8.3f}")
+        print("-" * 110)
+
     print("=" * 100)
     return 0
 

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SQLite persistence for Strategy‑Miner (Patch 0004)
+SQLite persistence for Strategy‑Miner (Patch 0005)
 
-Patch 0004: No schema changes.
-We only enhance top_strategies() to parse metrics_json["cv"] summary for display.
+Patch 0005: No schema changes.
+We enhance top_strategies() parsing for:
+- CV v2 fields (min sharpe delay/cost, positive folds coststress)
+- Regime attribution summary (coverage, dominance, worst_sharpe)
 
-Schema is Patch 0003 (eval_id versioned).
+Schema stays Patch 0003 (eval_id versioned).
 """
 
 from __future__ import annotations
@@ -98,12 +100,8 @@ def _get_user_version(con: sqlite3.Connection) -> int:
 
 
 def _migrate_from_patch0002(con: sqlite3.Connection) -> None:
-    """
-    Patch 0002 schema migration (kept from Patch 0003).
-    """
     if not _table_exists(con, "strategies"):
         return
-
     cols = _table_columns(con, "strategies")
     if "eval_id" in cols:
         return
@@ -385,7 +383,6 @@ def top_strategies(
             """
             SELECT strategy_hash, score,
                    train_sharpe, holdout_sharpe,
-                   train_calmar, holdout_calmar,
                    holdout_max_drawdown,
                    trades_holdout, turnover_holdout, exposure_holdout,
                    created_utc, genome_json,
@@ -401,33 +398,42 @@ def top_strategies(
         for r in cur.fetchall():
             metrics = {}
             try:
-                metrics = json.loads(r[12]) if r[12] else {}
+                metrics = json.loads(r[10]) if r[10] else {}
             except Exception:
                 metrics = {}
 
             cv = metrics.get("cv", {}) if isinstance(metrics, dict) else {}
+            reg = metrics.get("regime", {}) if isinstance(metrics, dict) else {}
+
             rows.append(
                 {
                     "strategy_hash": r[0],
                     "score": r[1],
                     "train_sharpe": r[2],
                     "holdout_sharpe": r[3],
-                    "train_calmar": r[4],
-                    "holdout_calmar": r[5],
-                    "holdout_max_drawdown": r[6],
-                    "trades_holdout": r[7],
-                    "turnover_holdout": r[8],
-                    "exposure_holdout": r[9],
-                    "created_utc": r[10],
-                    "genome": json.loads(r[11]),
-                    # CV summary (Patch 0004)
+                    "holdout_max_drawdown": r[4],
+                    "trades_holdout": r[5],
+                    "turnover_holdout": r[6],
+                    "exposure_holdout": r[7],
+                    "created_utc": r[8],
+                    "genome": json.loads(r[9]),
+
+                    # CV summary
                     "cv_median_sharpe": cv.get("median_sharpe"),
                     "cv_min_sharpe": cv.get("min_sharpe"),
                     "cv_std_sharpe": cv.get("std_sharpe"),
                     "cv_pos_folds": cv.get("positive_folds"),
                     "cv_n_folds": cv.get("n_folds"),
                     "cv_med_delay1": cv.get("median_sharpe_delay1"),
+                    "cv_min_delay1": cv.get("min_sharpe_delay1"),
                     "cv_med_cost": cv.get("median_sharpe_coststress"),
+                    "cv_min_cost": cv.get("min_sharpe_coststress"),
+                    "cv_pos_cost": cv.get("positive_folds_coststress"),
+
+                    # Regime
+                    "reg_coverage": reg.get("coverage"),
+                    "reg_dominance": reg.get("dominance"),
+                    "reg_worst_sharpe": reg.get("worst_sharpe"),
                 }
             )
         return str(eval_id), rows
