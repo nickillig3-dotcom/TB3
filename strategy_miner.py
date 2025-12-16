@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Strategy‑Miner entrypoint (Patch 0005)
+Strategy‑Miner entrypoint (Patch 0007)
 
 Patch 0005:
 - Evolutionary search mode (default) with ElitePool + mutation/crossover
@@ -32,6 +32,8 @@ from bt_eval import safe_bar_seconds
 from results_db import DBWriter, top_strategies
 from research_engine import ResearchConfig, EvalConfig, eval_id_from_eval_cfg, run_research
 from collections import Counter
+from resource_manager import load_capabilities_latest, recommend_resources
+from run_manifest import setup_run_logging, build_run_manifest, write_run_manifest
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -42,9 +44,17 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--minutes", type=float, default=1.0, help="How long to run research")
     p.add_argument("--db", type=str, default="strategy_results.sqlite", help="SQLite db path")
-    p.add_argument("--workers", type=int, default=0, help="Override worker count (0=auto)")
-    p.add_argument("--batch", type=int, default=0, help="Strategies per worker task (0=auto)")
-    p.add_argument("--inflight", type=int, default=0, help="Max tasks in flight (0=auto)")
+    p.add_argument("--workers", type=int, default=-1,
+                    help="Worker processes. -1=auto (default), >0=explicit.")
+    p.add_argument("--batch", type=int, default=-1,
+                    help="Batch size. -1=auto (default), >0=explicit.")
+    p.add_argument("--inflight", type=int, default=-1,
+                    help="In-flight task limit. -1=auto (default), >0=explicit.")
+
+    p.add_argument("--log-file", type=str, default="strategy_miner.log",
+                    help="Write logs to this file (in addition to console).")
+    p.add_argument("--run-manifest", type=str, default="run_latest.json",
+                    help="Write a JSON run-manifest for reproducibility.")
 
     # Demo settings
     p.add_argument("--demo-bars", type=int, default=120_000, help="Number of bars for demo dataset")
@@ -148,6 +158,25 @@ def _format_top(rows: list[dict], limit: int, eval_id: str | None) -> str:
 
 def main() -> int:
     args = _parse_args()
+    # ---- Patch 0007: file logging + auto resources ----
+    setup_run_logging(getattr(args, "log_file", None))
+
+    caps = load_capabilities_latest()
+
+    rec = recommend_resources(args, caps)
+    # Force resolved values onto args (only auto if args.* == -1 per recommend_resources)
+    args.workers = rec["workers"]
+    args.batch = rec["batch"]
+    args.inflight = rec["inflight"]
+
+    # Log (works with loguru if present, otherwise prints)
+    try:
+        from loguru import logger as _lg  # type: ignore
+        _lg.info(f"auto_resources: workers={args.workers} batch={args.batch} inflight={args.inflight} | {rec.get('reason','')}")
+    except Exception:
+       print(f"[auto_resources] workers={args.workers} batch={args.batch} inflight={args.inflight} | {rec.get('reason','')}")
+    # ---- /Patch 0007 ----
+
 
     set_thread_env(threads=1)
     ensure_dir("logs")
@@ -185,6 +214,20 @@ def main() -> int:
         bar_seconds = safe_bar_seconds(ts, default_bar_seconds=int(args.demo_bar_seconds))
 
     dataset_id = cache.dataset_id
+    # ---- Patch 0007: run manifest ----
+    try:
+        manifest = build_run_manifest(
+            args=args,
+            dataset_id=dataset_id,
+            eval_id=eval_id,
+            resources=rec,
+            capabilities=caps,
+        )
+        write_run_manifest(getattr(args, "run_manifest", "run_latest.json"), manifest)
+    except Exception:
+        # Never break the run because of manifest I/O
+        pass
+    # ---- /Patch 0007 ----
 
     # Worker count
     rec_workers = get_recommended_workers_from_capabilities("capabilities_latest.json")
