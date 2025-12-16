@@ -18,7 +18,7 @@ import time
 import copy
 from dataclasses import dataclass, asdict, field
 from typing import Any, Callable
-from collections import OrderedDict
+from collections import OrderedDict, Counter
 
 import numpy as np
 import multiprocessing as mp
@@ -383,9 +383,6 @@ class CandidateGenerator:
                 weight = wa + float(self.rng.normal(0.0, 0.10))
             else:
                 weight = wb + float(self.rng.normal(0.0, 0.10))
-
-            weight = _clamp(weight, -self.space.weight_abs_max, self.space.weight_abs_max)
-            child_parts.append({"name": name, "window": int(w), "weight": float(weight)})
 
             weight = _clamp(weight, -self.space.weight_abs_max, self.space.weight_abs_max)
             child_parts.append({"name": name, "window": int(w), "weight": float(weight)})
@@ -891,8 +888,46 @@ def _score_v4(
 
     return float(s)
 
+def _soft_elite_score_stage1(
+    m_train: dict[str, Any],
+    m_hold: dict[str, Any],
+    m_hold_stress: dict[str, Any] | None,
+    wf: dict[str, Any] | None,
+    trade_train: dict[str, Any],
+    trade_hold: dict[str, Any],
+) -> float:
+    """
+    Soft guidance score (NOT published). Used to keep evo search moving even when hard gates accept 0.
+    Should correlate with OOS robustness but be cheap and not depend on CV.
+    """
+    train_sh = float(m_train.get("sharpe", 0.0))
+    hold_sh = float(m_hold.get("sharpe", 0.0))
 
-def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) -> list[dict[str, Any]]:
+    if m_hold_stress is not None:
+        stress_sh = float(m_hold_stress.get("sharpe", hold_sh))
+    else:
+        stress_sh = hold_sh
+
+    gap = max(0.0, train_sh - hold_sh)
+    hold_mdd = abs(float(m_hold.get("max_drawdown", 0.0)))
+
+    turnover = float(trade_hold.get("turnover_mean", trade_train.get("turnover_mean", 0.0)))
+    dom = abs(float(wf.get("dominance", 0.0))) if wf else 0.0
+
+    s = 0.55 * hold_sh + 0.25 * train_sh + 0.10 * stress_sh
+    s -= 0.20 * gap
+    s -= 0.15 * hold_mdd
+    s -= 0.05 * turnover
+    s -= 0.10 * max(0.0, dom - 0.65)
+    return float(s)
+
+
+def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) -> dict[str, Any]:
+    """
+    Patch 0006:
+    - Returns accepted strategies AND (soft) elite_updates for non-stalling evo.
+    - Returns reject reason counts for diagnostics.
+    """
     global _G_CLOSE, _G_RET, _G_BAR_SECONDS, _G_FEATS
 
     if _G_CLOSE is None or _G_RET is None or _G_FEATS is None:
@@ -909,27 +944,47 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
     train_ret = ret[: max(0, min(split_close, ret.shape[0]))]
     holdout_ret = ret[max(0, min(split_close, ret.shape[0])) :]
 
+    # Batch-level guards (still return diagnostics)
     if train_ret.size < int(eval_cfg.min_train_bars):
-        return []
+        return {
+            "accepted": [],
+            "elite_updates": [],
+            "rejects": {"batch_train_too_short": int(len(genomes))},
+        }
     if holdout_ret.size < int(eval_cfg.min_holdout_bars):
-        return []
+        return {
+            "accepted": [],
+            "elite_updates": [],
+            "rejects": {"batch_holdout_too_short": int(len(genomes))},
+        }
 
-    # regime cache (lazy)
-    regime_cache = None
+    # Regime cache (lazy)
     regime_arr = None
     regime_info = None
     if bool(eval_cfg.regime_enabled):
-        regime_cache = _get_or_build_regime_cache(int(eval_cfg.regime_vol_window), int(eval_cfg.regime_trend_window))
-        regime_arr = regime_cache.get("regime", None)
-        regime_info = (regime_cache.get("info", {}) or {})
+        rc = _get_or_build_regime_cache(int(eval_cfg.regime_vol_window), int(eval_cfg.regime_trend_window))
+        regime_arr = rc.get("regime", None)
+        regime_info = (rc.get("info", {}) or {})
 
+    rejects = Counter()
     out: list[dict[str, Any]] = []
+    elite_scores: list[tuple[float, dict[str, Any]]] = []
+
+    def _rej(k: str) -> None:
+        rejects[k] += 1
+
+    def _add_elite(soft: float, genome: dict[str, Any]) -> None:
+        if not math.isfinite(float(soft)):
+            return
+        elite_scores.append((float(soft), genome))
 
     for genome in genomes:
         try:
             if genome.get("type") != "linear_alpha_v1":
+                _rej("fail_type")
                 continue
 
+            # Build alpha
             alpha = np.zeros(n_close, dtype=np.float32)
             for part in genome["features"]:
                 fname = str(part["name"])
@@ -944,81 +999,134 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
 
             valid = np.isfinite(alpha)
             mask = gate_mask & valid
-
             pos = _positions_from_alpha(alpha, genome["threshold"], mask)
 
-            # --- Stage 1: Train ---
+            # -------------------------
+            # Stage 1: Train
+            # -------------------------
             pos_train = pos[: split_close + 1]
             pnl_train, trade_train = pnl_from_positions(pos_train, train_ret, eval_cfg.costs, cost_multiplier=1.0)
             m_train = metrics_from_pnl(pnl_train, bar_seconds, mdd_floor=eval_cfg.mdd_floor, calmar_cap=eval_cfg.calmar_cap)
             if "error" in m_train:
+                _rej("fail_train_metrics_error")
                 continue
 
             if trade_train["exposure"] < eval_cfg.min_exposure_train:
+                _rej("fail_train_exposure")
                 continue
             if trade_train["active_bars"] < eval_cfg.min_active_bars_train:
+                _rej("fail_train_active_bars")
                 continue
             if trade_train["trades"] < eval_cfg.min_trades_train:
+                _rej("fail_train_trades")
                 continue
             if trade_train["turnover_mean"] > eval_cfg.max_turnover_mean_train:
+                _rej("fail_train_turnover")
                 continue
             if abs(m_train["max_drawdown"]) > eval_cfg.max_drawdown_abs_train:
+                _rej("fail_train_mdd")
                 continue
             if m_train["sharpe"] < eval_cfg.min_train_sharpe:
+                _rej("fail_train_sharpe")
                 continue
 
             wf = walkforward_metrics(
-                pnl_train, bar_seconds,
+                pnl_train,
+                bar_seconds,
                 n_splits=eval_cfg.n_walkforward_splits,
                 mdd_floor=eval_cfg.mdd_floor,
                 calmar_cap=eval_cfg.calmar_cap,
             )
             if "error" in wf:
+                _rej("fail_train_wf_error")
                 continue
             if wf["positive_segments"] < eval_cfg.min_wf_positive_segments:
+                _rej("fail_train_wf_pos_segments")
                 continue
             if abs(wf["dominance"]) > eval_cfg.max_wf_dominance:
+                _rej("fail_train_wf_dominance")
                 continue
 
             active_mask_train = (pos_train[:-1] != 0)
             m_train_active = metrics_from_pnl_masked(
-                pnl_train, active_mask_train,
+                pnl_train,
+                active_mask_train,
                 bar_seconds,
                 min_bars=max(50, int(0.02 * pnl_train.size)),
                 mdd_floor=eval_cfg.mdd_floor,
                 calmar_cap=eval_cfg.calmar_cap,
             )
 
-            # --- Stage 1: Holdout (OOS) ---
+            # -------------------------
+            # Stage 1: Holdout (OOS)
+            # -------------------------
             pos_hold = pos[split_close:]
             pnl_hold, trade_hold = pnl_from_positions(pos_hold, holdout_ret, eval_cfg.costs, cost_multiplier=1.0)
             m_hold = metrics_from_pnl(pnl_hold, bar_seconds, mdd_floor=eval_cfg.mdd_floor, calmar_cap=eval_cfg.calmar_cap)
             if "error" in m_hold:
+                _rej("fail_holdout_metrics_error")
                 continue
 
             if trade_hold["exposure"] < eval_cfg.min_exposure_holdout:
+                _rej("fail_holdout_exposure")
                 continue
             if trade_hold["active_bars"] < eval_cfg.min_active_bars_holdout:
+                _rej("fail_holdout_active_bars")
                 continue
             if trade_hold["trades"] < eval_cfg.min_trades_holdout:
+                _rej("fail_holdout_trades")
                 continue
             if trade_hold["turnover_mean"] > eval_cfg.max_turnover_mean_holdout:
+                _rej("fail_holdout_turnover")
                 continue
             if abs(m_hold["max_drawdown"]) > eval_cfg.max_drawdown_abs_holdout:
-                continue
-            if m_hold["sharpe"] < eval_cfg.min_holdout_sharpe:
+                _rej("fail_holdout_mdd")
                 continue
 
-            pnl_hold_s, _ = pnl_from_positions(pos_hold, holdout_ret, eval_cfg.costs, cost_multiplier=eval_cfg.stress_cost_mult)
-            m_hold_stress = metrics_from_pnl(pnl_hold_s, bar_seconds, mdd_floor=eval_cfg.mdd_floor, calmar_cap=eval_cfg.calmar_cap)
-            if "error" in m_hold_stress:
+            # soft score available after we have train+holdout (no stress yet)
+            soft_stage1 = _soft_elite_score_stage1(
+                m_train=m_train,
+                m_hold=m_hold,
+                m_hold_stress=None,
+                wf=wf,
+                trade_train=trade_train,
+                trade_hold=trade_hold,
+            )
+
+            if m_hold["sharpe"] < eval_cfg.min_holdout_sharpe:
+                _add_elite(soft_stage1, genome)
+                _rej("fail_holdout_sharpe")
                 continue
+
+            pnl_hold_s, _ = pnl_from_positions(
+                pos_hold, holdout_ret, eval_cfg.costs, cost_multiplier=float(eval_cfg.stress_cost_mult)
+            )
+            m_hold_stress = metrics_from_pnl(
+                pnl_hold_s, bar_seconds, mdd_floor=eval_cfg.mdd_floor, calmar_cap=eval_cfg.calmar_cap
+            )
+            if "error" in m_hold_stress:
+                _add_elite(soft_stage1, genome)
+                _rej("fail_holdout_stress_metrics_error")
+                continue
+
+            soft_stage1_stress = _soft_elite_score_stage1(
+                m_train=m_train,
+                m_hold=m_hold,
+                m_hold_stress=m_hold_stress,
+                wf=wf,
+                trade_train=trade_train,
+                trade_hold=trade_hold,
+            )
+
             if m_hold_stress["sharpe"] < eval_cfg.min_holdout_stress_sharpe:
+                _add_elite(soft_stage1_stress, genome)
+                _rej("fail_holdout_stress_sharpe")
                 continue
 
             active_mask_hold = (pos_hold[:-1] != 0)
             m_hold_active = metrics_from_pnl_masked(
-                pnl_hold, active_mask_hold,
+                pnl_hold,
+                active_mask_hold,
                 bar_seconds,
                 min_bars=max(40, int(0.02 * pnl_hold.size)),
                 mdd_floor=eval_cfg.mdd_floor,
@@ -1041,13 +1149,17 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
                 },
             }
 
-            # --- Stage 2: CV (Deep Validation) ---
+            # -------------------------
+            # Stage 2: CV (Deep Validation)
+            # -------------------------
             pass_flags = "train+wf+holdout+stress"
             cv_summary = None
 
             if bool(eval_cfg.deep_validation) and int(eval_cfg.cv_folds) >= 2:
                 cv_summary = _timeblock_cv(
-                    pos=pos, ret=ret, bar_seconds=bar_seconds,
+                    pos=pos,
+                    ret=ret,
+                    bar_seconds=bar_seconds,
                     genome=genome,
                     costs=eval_cfg.costs,
                     stress_cost_mult=eval_cfg.stress_cost_mult,
@@ -1058,6 +1170,8 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
                     calmar_cap=eval_cfg.calmar_cap,
                 )
                 if "error" in cv_summary:
+                    _add_elite(soft_stage1_stress, genome)
+                    _rej(f"fail_cv_{str(cv_summary.get('error'))}")
                     continue
 
                 n_folds_ok = int(cv_summary.get("n_folds", 0))
@@ -1069,36 +1183,56 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
                     min_pos = int(math.ceil(float(eval_cfg.cv_min_positive_folds_frac) * float(n_folds_ok)))
                 min_pos = max(1, min(min_pos, n_folds_ok))
                 if pos_folds < min_pos:
+                    _add_elite(soft_stage1_stress, genome)
+                    _rej("fail_cv_pos_folds")
                     continue
 
                 # base gates
                 if float(cv_summary.get("min_sharpe", -1e9)) < float(eval_cfg.cv_min_sharpe):
+                    _add_elite(soft_stage1_stress, genome)
+                    _rej("fail_cv_min_sharpe")
                     continue
                 if float(cv_summary.get("median_sharpe", -1e9)) < float(eval_cfg.cv_min_median_sharpe_base):
+                    _add_elite(soft_stage1_stress, genome)
+                    _rej("fail_cv_med_sharpe")
                     continue
                 if float(cv_summary.get("median_sharpe_delay1", -1e9)) < float(eval_cfg.cv_min_median_sharpe_delay1):
+                    _add_elite(soft_stage1_stress, genome)
+                    _rej("fail_cv_med_delay1")
                     continue
                 if float(cv_summary.get("median_sharpe_coststress", -1e9)) < float(eval_cfg.cv_min_median_sharpe_coststress):
+                    _add_elite(soft_stage1_stress, genome)
+                    _rej("fail_cv_med_cost")
                     continue
 
                 # v2 gates
                 if float(cv_summary.get("min_sharpe_delay1", -1e9)) < float(eval_cfg.cv_min_sharpe_delay1):
+                    _add_elite(soft_stage1_stress, genome)
+                    _rej("fail_cv_min_delay1")
                     continue
                 if float(cv_summary.get("min_sharpe_coststress", -1e9)) < float(eval_cfg.cv_min_sharpe_coststress):
+                    _add_elite(soft_stage1_stress, genome)
+                    _rej("fail_cv_min_cost")
                     continue
 
                 pos_folds_cost = int(cv_summary.get("positive_folds_coststress", 0))
                 min_pos_cost = int(eval_cfg.cv_min_positive_folds_coststress)
                 if min_pos_cost <= 0:
-                    min_pos_cost = int(math.ceil(float(eval_cfg.cv_min_positive_folds_coststress_frac) * float(n_folds_ok)))
+                    min_pos_cost = int(
+                        math.ceil(float(eval_cfg.cv_min_positive_folds_coststress_frac) * float(n_folds_ok))
+                    )
                 min_pos_cost = max(1, min(min_pos_cost, n_folds_ok))
                 if pos_folds_cost < min_pos_cost:
+                    _add_elite(soft_stage1_stress, genome)
+                    _rej("fail_cv_pos_cost_folds")
                     continue
 
                 metrics["cv"] = cv_summary
                 pass_flags = "train+wf+holdout+stress+cv"
 
-            # --- Regime attribution (new) ---
+            # -------------------------
+            # Regime attribution (non-gating)
+            # -------------------------
             regime_metrics = None
             if bool(eval_cfg.regime_enabled) and regime_arr is not None:
                 try:
@@ -1117,27 +1251,47 @@ def evaluate_genomes_batch(genomes: list[dict[str, Any]], eval_cfg: EvalConfig) 
                     metrics["regime"] = regime_metrics
                     pass_flags += "+regime"
                 except Exception:
-                    pass
+                    _rej("warn_regime_exception")
 
-            # --- Score v4 ---
+            # -------------------------
+            # Score
+            # -------------------------
             if cv_summary is not None and "error" not in cv_summary:
-                score = _score_v4(m_train, m_hold, m_hold_stress, wf, trade_train, trade_hold, cv_summary, regime_metrics)
+                score = _score_v4(
+                    m_train, m_hold, m_hold_stress, wf, trade_train, trade_hold, cv_summary, regime_metrics
+                )
             else:
                 # fallback (deep_validation disabled)
                 score = 0.55 * float(m_hold.get("sharpe", 0.0)) + 0.25 * float(m_train.get("sharpe", 0.0))
 
             strat_hash = stable_hash({"genome_v": 1, "genome": genome})
-            out.append({
-                "strategy_hash": strat_hash,
-                "genome": genome,
-                "metrics": metrics,
-                "score": float(score),
-                "pass_flags": pass_flags,
-            })
+            out.append(
+                {
+                    "strategy_hash": strat_hash,
+                    "genome": genome,
+                    "metrics": metrics,
+                    "score": float(score),
+                    "pass_flags": pass_flags,
+                }
+            )
+
         except Exception:
+            _rej("fail_exception")
             continue
 
-    return out
+    # Choose a few best near-miss candidates as soft elite updates
+    elite_updates: list[dict[str, Any]] = []
+    if elite_scores:
+        elite_scores.sort(key=lambda x: x[0], reverse=True)
+        k = int(max(2, min(8, math.ceil(0.06 * max(1, len(genomes))))))
+        for sc, g in elite_scores[:k]:
+            elite_updates.append({"score": float(sc), "genome": g})
+
+    return {
+        "accepted": out,
+        "elite_updates": elite_updates,
+        "rejects": dict(rejects),
+    }
 
 
 # -----------------------------
@@ -1155,13 +1309,19 @@ def run_research(
     on_progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     rng = np.random.default_rng(int(cfg.seed))
-
     deadline = time.time() + float(cfg.run_minutes) * 60.0
+
     total_tested = 0
     total_accepted = 0
-    best_score = -1e9
+    best_published_score = -1e9
+
     t0 = time.time()
     last_report = t0
+
+    # recent diagnostics window (since last on_progress)
+    reject_total = Counter()
+    reject_recent = Counter()
+    elite_updates_recent = 0
 
     ctx = mp.get_context("spawn")
 
@@ -1176,9 +1336,62 @@ def run_research(
         frac_crossover=float(cfg.evo_frac_crossover),
         seed_genomes=list(cfg.elite_seed_genomes),
     )
-    # also seed elite pool (low score placeholders) so mutate/crossover works immediately
+
+    # seed elite pool (low-score placeholders) so mutate/crossover works immediately
     for g in cfg.elite_seed_genomes[: min(128, len(cfg.elite_seed_genomes))]:
         cand.update_elite(score=0.0, genome=g)
+
+    def _consume_batch_result(batch_res: Any) -> None:
+        nonlocal total_accepted, best_published_score, elite_updates_recent
+
+        accepted: list[dict[str, Any]] = []
+        elite_updates: list[dict[str, Any]] = []
+        rejects: dict[str, Any] = {}
+
+        if isinstance(batch_res, dict) and "accepted" in batch_res:
+            accepted = list(batch_res.get("accepted") or [])
+            elite_updates = list(batch_res.get("elite_updates") or [])
+            rejects = dict(batch_res.get("rejects") or {})
+        else:
+            # Backward compatibility (if something returns a list)
+            accepted = list(batch_res or [])
+
+        # rejects accounting
+        if rejects:
+            for k, v in rejects.items():
+                try:
+                    n = int(v)
+                except Exception:
+                    continue
+                if n <= 0:
+                    continue
+                reject_total[k] += n
+                reject_recent[k] += n
+
+        # soft elite updates (non-published)
+        if elite_updates:
+            elite_updates_recent += int(len(elite_updates))
+            for u in elite_updates:
+                try:
+                    g = u.get("genome", None)
+                    if not isinstance(g, dict):
+                        continue
+                    sc = float(u.get("score", -1e9))
+                    cand.update_elite(sc, g)
+                except Exception:
+                    continue
+
+        # accepted / published
+        for r in accepted:
+            total_accepted += 1
+            sc = float(r.get("score", -1e9))
+            if sc > best_published_score:
+                best_published_score = sc
+            try:
+                cand.update_elite(sc, r["genome"])
+            except Exception:
+                pass
+            on_result(r)
 
     with ProcessPoolExecutor(
         max_workers=int(cfg.workers),
@@ -1190,6 +1403,7 @@ def run_research(
         max_in_flight = int(max(1, cfg.max_in_flight))
 
         while time.time() < deadline:
+            # submit more work
             while len(pending) < max_in_flight and time.time() < deadline:
                 genomes = cand.next_batch(cfg.batch_size)
                 if not genomes:
@@ -1199,49 +1413,53 @@ def run_research(
                 total_tested += len(genomes)
 
             done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+
             for fut in done:
                 try:
-                    results = fut.result()
+                    batch_res = fut.result()
                 except Exception:
+                    # we don't know exact reject reason here
                     continue
-
-                for r in results:
-                    total_accepted += 1
-                    sc = float(r.get("score", -1e9))
-                    best_score = max(best_score, sc)
-                    cand.update_elite(sc, r["genome"])
-                    on_result(r)
+                _consume_batch_result(batch_res)
 
             now = time.time()
             if on_progress is not None and (now - last_report) >= 2.5:
                 dt = max(1e-9, now - t0)
-                on_progress({
-                    "ts": utc_now_iso(),
-                    "tested": total_tested,
-                    "accepted": total_accepted,
-                    "tested_per_sec": total_tested / dt,
-                    "accepted_pct": (total_accepted / max(1, total_tested)) * 100.0,
-                    "best_score": best_score,
-                    "in_flight": len(pending),
-                    "elite_size": cand.elite.size(),
-                    "elite_best": cand.elite.best_score(),
-                    "seen": len(cand.seen),
-                })
+                on_progress(
+                    {
+                        "ts": utc_now_iso(),
+                        "tested": total_tested,
+                        "accepted": total_accepted,
+                        "tested_per_sec": total_tested / dt,
+                        "accepted_pct": (total_accepted / max(1, total_tested)) * 100.0,
+                        # published best (db-worthy)
+                        "best_score": best_published_score,
+                        # elite best (guidance; includes soft updates)
+                        "elite_best": cand.elite.best_score(),
+                        "elite_size": cand.elite.size(),
+                        "seen": len(cand.seen),
+                        "in_flight": len(pending),
+                        "elite_updates_recent": int(elite_updates_recent),
+                        "reject_counts_recent": dict(reject_recent),
+                        "rejects_recent_total": int(sum(reject_recent.values())),
+                        "reject_top": list(reject_recent.most_common(6)),
+                        "rejects_total": int(sum(reject_total.values())),
+                    }
+                )
+                # reset recent window
+                reject_recent.clear()
+                elite_updates_recent = 0
                 last_report = now
 
+        # drain remaining
         if pending:
             done, _ = wait(pending, timeout=5.0)
             for fut in done:
                 try:
-                    results = fut.result()
+                    batch_res = fut.result()
                 except Exception:
                     continue
-                for r in results:
-                    total_accepted += 1
-                    sc = float(r.get("score", -1e9))
-                    best_score = max(best_score, sc)
-                    cand.update_elite(sc, r["genome"])
-                    on_result(r)
+                _consume_batch_result(batch_res)
 
     dt = max(1e-9, time.time() - t0)
     return {
@@ -1249,6 +1467,9 @@ def run_research(
         "accepted": total_accepted,
         "tested_per_sec": total_tested / dt,
         "accepted_pct": (total_accepted / max(1, total_tested)) * 100.0,
-        "best_score": best_score,
+        "best_score": best_published_score,
+        "elite_best": cand.elite.best_score(),
         "seconds": dt,
+        "rejects_total": int(sum(reject_total.values())),
+        "reject_top": list(reject_total.most_common(10)),
     }

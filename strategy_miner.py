@@ -31,7 +31,7 @@ from data_cache import prepare_demo_dataset, prepare_csv_dataset
 from bt_eval import safe_bar_seconds
 from results_db import DBWriter, top_strategies
 from research_engine import ResearchConfig, EvalConfig, eval_id_from_eval_cfg, run_research
-
+from collections import Counter
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -64,6 +64,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--min-trades-train", type=int, default=60)
     p.add_argument("--min-trades-holdout", type=int, default=10)
     p.add_argument("--stress-cost-mult", type=float, default=3.0)
+    p.add_argument("--min-train-sharpe", type=float, default=0.25)
+    p.add_argument("--min-holdout-sharpe", type=float, default=0.05)
+    p.add_argument("--min-holdout-stress-sharpe", type=float, default=0.00)
 
     # Deep validation (Stage-2 CV)
     p.add_argument("--cv-folds", type=int, default=5)
@@ -197,6 +200,10 @@ def main() -> int:
         holdout_frac=float(args.holdout_frac),
         stress_cost_mult=float(args.stress_cost_mult),
 
+        min_train_sharpe=float(args.min_train_sharpe),
+        min_holdout_sharpe=float(args.min_holdout_sharpe),
+        min_holdout_stress_sharpe=float(args.min_holdout_stress_sharpe),
+
         min_exposure_train=float(args.min_exposure_train),
         min_exposure_holdout=float(args.min_exposure_holdout),
         min_trades_train=int(args.min_trades_train),
@@ -297,6 +304,7 @@ def main() -> int:
     )
 
     accepted_since = 0
+    rej_since = Counter()
     last_db_report = time.time()
 
     def on_result(r: dict) -> None:
@@ -314,16 +322,39 @@ def main() -> int:
         )
 
     def on_progress(p: dict) -> None:
-        nonlocal accepted_since, last_db_report
+        nonlocal accepted_since, last_db_report, rej_since
+        # accumulate reject stats into 10s window
+        rc = p.get("reject_counts_recent") or {}
+        try:
+            for k, v in rc.items():
+                rej_since[str(k)] += int(v)
+        except Exception:
+            pass
+
+        rej_top = p.get("reject_top") or []
+        rej_short = ", ".join([f"{k}:{v}" for (k, v) in rej_top[:4]]) if rej_top else "n/a"
+
         logger.info(
             f"tested={p['tested']} | acc={p['accepted']} ({p['accepted_pct']:.2f}%) | "
-            f"rate={p['tested_per_sec']:.1f}/s | best_score={p['best_score']:.3f} | "
+            f"rate={p['tested_per_sec']:.1f}/s | best_pub={p['best_score']:.3f} | elite_best={p.get('elite_best', -1e9):.3f} | "
+            f"elite_up={int(p.get('elite_updates_recent', 0))} | rej_top={rej_short} | "
             f"in_flight={p['in_flight']} | elite={p.get('elite_size',0)} | seen={p.get('seen',0)}"
         )
+
         now = time.time()
         if now - last_db_report >= 10.0:
             logger.info(f"accepted_last_10s={accepted_since}")
+
+            if rej_since:
+                tot = int(sum(rej_since.values()))
+                top = sorted(rej_since.items(), key=lambda x: x[1], reverse=True)[:6]
+                top_s = ", ".join([f"{k}:{v} ({(100.0*v/max(1,tot)):.1f}%)" for k, v in top])
+                logger.info(f"reject_last_10s={tot} | top={top_s}")
+            else:
+                logger.info("reject_last_10s=0")
+
             accepted_since = 0
+            rej_since.clear()
             last_db_report = now
 
     cfg = ResearchConfig(
@@ -354,8 +385,12 @@ def main() -> int:
     logger.info("=== DONE ===")
     logger.info(
         f"tested={summary['tested']} | accepted={summary['accepted']} ({summary['accepted_pct']:.2f}%) | "
-        f"rate={summary['tested_per_sec']:.1f}/s | best_score={summary['best_score']:.3f} | seconds={summary['seconds']:.1f}"
+        f"rate={summary['tested_per_sec']:.1f}/s | best_pub={summary['best_score']:.3f} | elite_best={summary.get('elite_best', -1e9):.3f} | "
+        f"seconds={summary['seconds']:.1f}"
     )
+    if summary.get("reject_top"):
+        logger.info(f"reject_top_total={summary.get('reject_top')}")
+
 
     _eval_id, rows = top_strategies(args.db, dataset_id, limit=10, eval_id=eval_id)
     print(_format_top(rows, 10, _eval_id))
